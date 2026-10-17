@@ -1,7 +1,6 @@
 """
 Socialize — repo host + form capture + file manager.
-Local (Pydroid 3): python app.py         -> SQLite fallback
-Render:            gunicorn app:app      -> PostgreSQL via DATABASE_URL
+Runs with PostgreSQL (or SQLite fallback if DATABASE_URL is missing).
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -11,19 +10,28 @@ from flask import (Flask, request, session, redirect, url_for,
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
 
+# ---------------- config ----------------
 BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "socialize123")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-db_url = os.environ.get("DATABASE_URL", "sqlite:///" + os.path.join(BASE, "socialize.db"))
+DATABASE_URL = "postgresql://neondb_owner:npg_V06GRufFMiyB@ep-still-field-b4uk713g-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+# Allow overriding via env var (Render dashboard), but default to the Neon URL above
+db_url = os.environ.get("DATABASE_URL", DATABASE_URL)
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+}
 db = SQLAlchemy(app)
 
+# ---------------- models ----------------
 class Repo(db.Model):
     __tablename__ = "repos"
     id = db.Column(db.Integer, primary_key=True)
@@ -53,13 +61,17 @@ class Submission(db.Model):
 with app.app_context():
     db.create_all()
 
+# ---------------- helpers ----------------
 def esc(s): return html_mod.escape(str(s))
+
 def fmt_size(n):
     n = n or 0
     if n < 1024: return f"{n} B"
     if n < 1024*1024: return f"{n/1024:.1f} KB"
     return f"{n/1024/1024:.1f} MB"
+
 def is_admin(): return session.get("admin") is True
+
 def admin_required(f):
     @wraps(f)
     def w(*a, **k):
@@ -67,8 +79,10 @@ def admin_required(f):
             return redirect(url_for("login", next=request.path))
         return f(*a, **k)
     return w
+
 def get_repo(slug):
     return Repo.query.filter(func.lower(Repo.slug) == slug.lower()).first()
+
 def phone_download_dir():
     for c in ("/storage/emulated/0/Download", "/sdcard/Download",
               os.path.expanduser("~/Download"), os.path.expanduser("~/Downloads")):
@@ -129,41 +143,117 @@ def inject_capture(html_text, slug):
         return html_text.replace("</body>", script + "</body>", 1)
     return html_text + script
 
+# ---------------- responsive CSS ----------------
 CSS = """<style>
-:root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--accent:#38bdf8;--muted:#94a3b8;--danger:#f87171;--border:#334155}
-*{box-sizing:border-box}
-body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
-.wrap{max-width:1000px;margin:0 auto;padding:24px}
-header{display:flex;justify-content:space-between;align-items:center;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:24px}
-h1{margin:0;font-size:22px}h2{font-size:17px;margin:0 0 12px}
+:root{
+  --bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--accent:#38bdf8;
+  --muted:#94a3b8;--danger:#f87171;--border:#334155;
+  --pad:24px;--radius:12px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  background:var(--bg);color:var(--text);line-height:1.5;
+  padding:env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.wrap{max-width:1000px;margin:0 auto;padding:var(--pad)}
+header{
+  display:flex;justify-content:space-between;align-items:center;
+  gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);
+  margin-bottom:24px;flex-wrap:wrap;
+}
+h1{margin:0;font-size:22px}
+h2{font-size:17px;margin:0 0 12px;line-height:1.3}
 .brand{color:var(--accent)}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-.card{background:var(--card);border-radius:12px;padding:20px;margin-bottom:16px;border:1px solid var(--border)}
-input,textarea,select{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:var(--text);width:100%}
-textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px;min-height:320px;resize:vertical}
-button{background:var(--accent);color:#0f172a;font-weight:600;border:none;cursor:pointer;width:auto;padding:10px 18px;border-radius:8px}
-button:hover{opacity:.9}button.danger{background:var(--danger);color:#fff}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.card{
+  background:var(--card);border-radius:var(--radius);padding:20px;
+  margin-bottom:16px;border:1px solid var(--border);
+}
+input,textarea,select{
+  font:inherit;font-size:16px;
+  padding:12px 14px;border-radius:8px;border:1px solid #475569;
+  background:#0f172a;color:var(--text);width:100%;max-width:100%;
+}
+textarea{
+  font-family:ui-monospace,Menlo,monospace;font-size:13px;
+  min-height:320px;resize:vertical;
+}
+button{
+  background:var(--accent);color:#0f172a;font-weight:600;border:none;
+  cursor:pointer;width:auto;padding:12px 20px;border-radius:8px;
+  font-size:15px;min-height:44px;touch-action:manipulation;
+}
+button:hover{opacity:.9}
+button:active{transform:scale(.98)}
+button.danger{background:var(--danger);color:#fff}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
-.row input{flex:1;min-width:120px}
+.row input{flex:1;min-width:160px}
 .muted{color:var(--muted);font-size:14px}
-table{width:100%;border-collapse:collapse;margin-top:8px}
-td,th{padding:8px 10px;text-align:left;border-bottom:1px solid var(--border);font-size:14px;vertical-align:middle}
-th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase}
+.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:8px}
+table{width:100%;border-collapse:collapse;min-width:520px}
+td,th{
+  padding:10px;text-align:left;border-bottom:1px solid var(--border);
+  font-size:14px;vertical-align:middle;
+}
+th{
+  color:var(--muted);font-weight:500;font-size:12px;
+  text-transform:uppercase;white-space:nowrap;
+}
 tr:hover td{background:rgba(56,189,248,.05)}
-.flash{padding:12px;background:#1e3a5f;border-radius:8px;margin-bottom:16px;border-left:4px solid var(--accent)}
-pre{margin:0;font-size:12px;overflow:auto;max-height:220px;background:#0b1220;padding:8px;border-radius:6px}
+.flash{
+  padding:12px;background:#1e3a5f;border-radius:8px;
+  margin-bottom:16px;border-left:4px solid var(--accent);
+}
+pre{
+  margin:0;font-size:12px;overflow:auto;max-height:220px;
+  background:#0b1220;padding:8px;border-radius:6px;
+  white-space:pre-wrap;word-break:break-word;
+}
+@media (max-width:640px){
+  :root{--pad:14px;--radius:10px}
+  body{font-size:15px}
+  h1{font-size:19px}
+  h2{font-size:16px;margin-bottom:10px}
+  .card{padding:14px;margin-bottom:12px}
+  .row{flex-direction:column;align-items:stretch;gap:8px}
+  .row input,.row button,.row select{width:100%;min-width:0}
+  header{flex-direction:row;flex-wrap:wrap;gap:8px}
+  header h1{font-size:18px;flex:1 1 100%}
+  header > div{width:100%;text-align:right;font-size:14px}
+  form .row button{width:100%}
+  table{min-width:0;font-size:13px}
+  td,th{padding:8px 6px}
+  th{font-size:11px}
+  td form{display:inline}
+  td form button{padding:4px 10px;font-size:12px;min-height:32px}
+  textarea{min-height:50vh;font-size:14px}
+  table input[type=checkbox]{width:20px;height:20px;margin:0;vertical-align:middle}
+  pre{font-size:11px;max-height:160px}
+  .card[style*="margin:60px"]{margin:24px auto !important}
+}
+@media (max-width:380px){
+  :root{--pad:10px}
+  h1{font-size:17px}
+  button{padding:10px 14px;font-size:14px}
+  .card{padding:12px}
+}
 </style>"""
 
 def page(title, body):
     signout = '<a href="/logout">Sign out</a>' if is_admin() else ''
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{esc(title)} · Socialize</title>{CSS}</head><body>
 <div class="wrap">
 <header><h1><a href="/" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
 <div>{signout}</div></header>
 {body}</div></body></html>"""
 
+# ---------------- auth ----------------
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
@@ -192,12 +282,14 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
+# ---------------- dashboard ----------------
 @app.route("/")
 @admin_required
 def dashboard():
     repos = Repo.query.order_by(Repo.created_at.desc()).all()
     total_subs = Submission.query.count()
     recent = Submission.query.order_by(Submission.created_at.desc()).limit(25).all()
+
     repo_rows = ""
     if repos:
         for r in repos:
@@ -211,11 +303,12 @@ def dashboard():
                 <a href="/export/{esc(r.slug)}">Export ZIP</a> ·
                 <form method="post" action="/repos/{esc(r.slug)}/delete" style="display:inline"
                       onsubmit="return confirm('Delete repo and all files?')">
-                  <button class="danger" style="padding:3px 10px;font-size:12px">Delete</button>
+                  <button class="danger" style="padding:3px 10px;font-size:12px;min-height:0">Delete</button>
                 </form>
               </td></tr>"""
     else:
         repo_rows = '<tr><td colspan="4" class="muted">No repos yet.</td></tr>'
+
     sub_rows = ""
     if recent:
         for s in recent:
@@ -231,6 +324,7 @@ def dashboard():
             </tr>"""
     else:
         sub_rows = '<tr><td colspan="3" class="muted">No submissions yet.</td></tr>'
+
     body = f"""
     <div class="card">
       <h2>Create repository</h2>
@@ -242,11 +336,15 @@ def dashboard():
     </div>
     <div class="card">
       <h2>Repositories ({len(repos)})</h2>
-      <table><tr><th>Slug</th><th>Files</th><th>Submissions</th><th>Actions</th></tr>{repo_rows}</table>
+      <div class="table-wrap">
+        <table><tr><th>Slug</th><th>Files</th><th>Submissions</th><th>Actions</th></tr>{repo_rows}</table>
+      </div>
     </div>
     <div class="card">
       <h2>Recent submissions ({total_subs} total)</h2>
-      <table><tr><th>Time</th><th>Repo</th><th>Data</th></tr>{sub_rows}</table>
+      <div class="table-wrap">
+        <table><tr><th>Time</th><th>Repo</th><th>Data</th></tr>{sub_rows}</table>
+      </div>
     </div>
     """
     return page("Dashboard", body)
@@ -278,6 +376,7 @@ def delete_repo(slug):
         flash(f"Deleted repo: {slug}")
     return redirect(url_for("dashboard"))
 
+# ---------------- public serving ----------------
 def _serve_file(f, repo):
     content = f.content or ""
     mime = mimetypes.guess_type(f.path)[0] or "text/plain"
@@ -311,6 +410,7 @@ def serve_path(slug, filepath):
     if not f: abort(404)
     return _serve_file(f, repo)
 
+# ---------------- form capture ----------------
 @app.route("/_capture/<slug>", methods=["POST"])
 def capture(slug):
     repo = get_repo(slug)
@@ -320,6 +420,7 @@ def capture(slug):
     db.session.commit()
     return jsonify(ok=True)
 
+# ---------------- file manager ----------------
 def _flash_html():
     out = ""
     for m in get_flashed_messages():
@@ -332,15 +433,16 @@ def manage_files(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
     files = File.query.filter_by(repo_id=repo.id).order_by(File.path).all()
+
     rows = ""
     for f in files:
-        icon = "FOLDER" if f.is_dir else "FILE"
+        icon = "📁" if f.is_dir else "📄"
         disp = esc(f.path) + ("/" if f.is_dir else "")
         edit = f'<a href="/_manage/{esc(repo.slug)}/edit?path={esc(f.path)}">Edit</a> · ' if not f.is_dir else ''
         view = f'<a href="/{esc(repo.slug)}/{esc(f.path)}" target="_blank">View</a> · ' if not f.is_dir else ''
         rows += f"""<tr>
           <td><input type="checkbox" name="paths" value="{esc(f.path)}" style="width:auto"></td>
-          <td>[{icon}] {disp}</td>
+          <td>{icon} {disp}</td>
           <td class="muted">{fmt_size(f.size)}</td>
           <td class="muted">{f.updated_at.strftime('%Y-%m-%d %H:%M') if f.updated_at else ''}</td>
           <td>{edit}{view}<a href="/_manage/{esc(repo.slug)}/delete-one?path={esc(f.path)}"
@@ -348,6 +450,7 @@ def manage_files(slug):
         </tr>"""
     if not files:
         rows = '<tr><td colspan="5" class="muted">No files. Upload a ZIP or create one.</td></tr>'
+
     body = f"""
     {_flash_html()}
     <div class="card">
@@ -384,10 +487,12 @@ def manage_files(slug):
           <button type="submit" formaction="/_manage/{esc(repo.slug)}/delete"
                   class="danger" onclick="return confirm('Delete selected?')">Delete Selected</button>
         </div>
-        <table>
-          <tr><th></th><th>Path</th><th>Size</th><th>Updated</th><th>Actions</th></tr>
-          {rows}
-        </table>
+        <div class="table-wrap">
+          <table>
+            <tr><th></th><th>Path</th><th>Size</th><th>Updated</th><th>Actions</th></tr>
+            {rows}
+          </table>
+        </div>
       </form>
     </div>
     """
@@ -522,6 +627,7 @@ def edit_file(slug):
     """
     return page("Edit " + path, body)
 
+# ---------------- export ----------------
 @app.route("/export/<slug>")
 @admin_required
 def export_repo(slug):
@@ -536,6 +642,7 @@ def export_repo(slug):
                      for s in subs]
         z.writestr("_submissions.json", json.dumps(subs_data, indent=2))
     buf.seek(0)
+
     dl = phone_download_dir()
     if dl:
         try:
@@ -544,6 +651,7 @@ def export_repo(slug):
             buf.seek(0)
         except Exception:
             pass
+
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=f"{repo.slug}.zip")
 

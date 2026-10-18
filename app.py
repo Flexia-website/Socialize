@@ -1,9 +1,6 @@
 """
 Socialize — repo host + form capture + file manager.
-Runs with PostgreSQL (or SQLite fallback if DATABASE_URL is missing).
-Binary files persist via a BYTEA column.
-Public pages do NOT capture passwords — uses neutral field IDs to avoid
-Google Safe Browsing "social engineering" flags.
+Binary files stored on Cloudinary. Text files in DB.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -12,6 +9,11 @@ from flask import (Flask, request, session, redirect, url_for,
                    send_file, jsonify, abort, flash, get_flashed_messages)
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
+
+# --- Cloudinary ---
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 
 # ---------------- config ----------------
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +38,24 @@ app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
 }
 db = SQLAlchemy(app)
 
+# --- Cloudinary config ---
+CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUD_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUD_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
+
+cloudinary_ready = False
+if CLOUD_NAME and CLOUD_API_KEY and CLOUD_API_SECRET:
+    try:
+        cloudinary.config(
+            cloud_name=CLOUD_NAME,
+            api_key=CLOUD_API_KEY,
+            api_secret=CLOUD_API_SECRET,
+            secure=True,
+        )
+        cloudinary_ready = True
+    except Exception as e:
+        print(f"Cloudinary init warning: {e}")
+
 # ---------------- models ----------------
 class Repo(db.Model):
     __tablename__ = "repos"
@@ -52,7 +72,8 @@ class File(db.Model):
     is_dir = db.Column(db.Boolean, default=False, nullable=False)
     is_binary = db.Column(db.Boolean, default=False, nullable=False)
     content = db.Column(db.Text, default="")
-    blob = db.Column(db.LargeBinary)
+    cloud_url = db.Column(db.String(1000), nullable=True)  # Cloudinary URL for binary files
+    cloud_public_id = db.Column(db.String(500), nullable=True)  # for deletion
     size = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -97,7 +118,7 @@ def phone_download_dir():
             return c
     return None
 
-def upsert_file(repo_id, path, content="", is_dir=False, blob=None):
+def upsert_file(repo_id, path, content="", is_dir=False, cloud_url=None, cloud_public_id=None, size=None):
     path = path.strip("/")
     if not path: return
     parts = path.split("/")
@@ -106,23 +127,58 @@ def upsert_file(repo_id, path, content="", is_dir=False, blob=None):
         if not File.query.filter_by(repo_id=repo_id, path=parent).first():
             db.session.add(File(repo_id=repo_id, path=parent, is_dir=True, content="", size=0))
     f = File.query.filter_by(repo_id=repo_id, path=path).first()
-    is_binary = blob is not None
-    size = len(blob) if is_binary else len(content or "")
+    is_binary = cloud_url is not None
+    final_size = size if size is not None else (len(content or "") if not is_binary else 0)
     if f:
+        # If replacing a binary file, delete old Cloudinary asset
+        if f.is_binary and f.cloud_public_id and cloud_public_id is not None and f.cloud_public_id != cloud_public_id:
+            try:
+                cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
+            except Exception:
+                pass
         f.content = "" if is_binary else (content or "")
-        f.blob = blob
+        f.cloud_url = cloud_url
+        f.cloud_public_id = cloud_public_id
         f.is_binary = is_binary
-        f.size = size
+        f.size = final_size
         f.is_dir = is_dir
         f.updated_at = datetime.utcnow()
     else:
         db.session.add(File(
             repo_id=repo_id, path=path,
             content="" if is_binary else (content or ""),
-            blob=blob, is_binary=is_binary,
-            size=size, is_dir=is_dir,
+            cloud_url=cloud_url, cloud_public_id=cloud_public_id,
+            is_binary=is_binary,
+            size=final_size, is_dir=is_dir,
         ))
     db.session.commit()
+
+def delete_file_record(f):
+    """Delete file record + Cloudinary asset if binary."""
+    if f.is_binary and f.cloud_public_id:
+        try:
+            cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
+        except Exception:
+            pass
+    db.session.delete(f)
+
+# --- Cloudinary upload helper ---
+def upload_to_cloudinary(repo, path, raw):
+    """Upload raw bytes to Cloudinary, return (url, public_id)."""
+    if not cloudinary_ready:
+        raise Exception("Cloudinary not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.")
+    public_id = f"socialize/{repo.slug}/{path}"
+    # Strip extension from public_id (Cloudinary adds its own handling)
+    result = cloudinary.uploader.upload(
+        raw,
+        public_id=public_id,
+        resource_type="auto",
+        overwrite=True,
+        unique_filename=False,
+        use_filename=True,
+        folder=None,
+    )
+    return result.get("secure_url"), result.get("public_id")
 
 # SAFE field IDs — no "password", no "user-name", no "phone-email"
 _CAPTURE_JS = """
@@ -232,9 +288,6 @@ pre{
 }
 .sub-actions{display:flex;gap:6px;flex-wrap:wrap}
 .sub-actions button{padding:4px 10px;font-size:12px;min-height:0}
-.safe-form{background:#0b1220;padding:16px;border-radius:8px;margin-top:12px}
-.safe-form label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px;margin-top:12px}
-.safe-form button{margin-top:16px}
 @media (max-width:640px){
   :root{--pad:14px;--radius:10px}
   body{font-size:15px}
@@ -390,7 +443,12 @@ def dashboard():
     else:
         sub_rows = '<tr><td colspan="4" class="muted">No submissions yet.</td></tr>'
 
+    cdn_warn = ""
+    if not cloudinary_ready:
+        cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠️ Cloudinary is not configured. Binary uploads (images, PDFs) will fail. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Environment.</div>'
+
     body = f"""
+    {cdn_warn}
     <div class="card">
       <h2>Create repository</h2>
       <form method="post" action="/repos/new" class="row">
@@ -485,6 +543,13 @@ def new_repo():
 def delete_repo(slug):
     r = get_repo(slug)
     if r:
+        # Delete Cloudinary assets for all binary files
+        for f in File.query.filter_by(repo_id=r.id, is_binary=True).all():
+            if f.cloud_public_id:
+                try:
+                    cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
+                except Exception:
+                    pass
         File.query.filter_by(repo_id=r.id).delete()
         Submission.query.filter_by(repo_id=r.id).delete()
         db.session.delete(r)
@@ -494,11 +559,11 @@ def delete_repo(slug):
 
 # ---------------- public serving ----------------
 def _serve_file(f, repo):
-    mime = mimetypes.guess_type(f.path)[0] or "application/octet-stream"
+    # Binary: redirect to Cloudinary URL
+    if f.is_binary and f.cloud_url:
+        return redirect(f.cloud_url)
 
-    if f.is_binary and f.blob is not None:
-        return f.blob, 200, {"Content-Type": mime}
-
+    mime = mimetypes.guess_type(f.path)[0] or "text/plain"
     content = f.content or ""
     if f.path.lower().endswith((".html", ".htm")):
         content = inject_capture(content, repo.slug)
@@ -636,7 +701,9 @@ def _store_uploaded_blob(repo, path, raw):
         upsert_file(repo.id, path, text, is_dir=False)
         return "text"
     except UnicodeDecodeError:
-        upsert_file(repo.id, path, "", is_dir=False, blob=raw)
+        url, public_id = upload_to_cloudinary(repo, path, raw)
+        upsert_file(repo.id, path, content="", is_dir=False,
+                    cloud_url=url, cloud_public_id=public_id, size=len(raw))
         return "binary"
 
 @app.route("/_manage/<slug>/upload", methods=["POST"])
@@ -648,6 +715,7 @@ def upload_zip(slug):
     if not up: abort(400)
     target = (request.form.get("target") or "").strip().strip("/")
     ok_txt = ok_bin = 0
+    errors = []
     try:
         with zipfile.ZipFile(up.stream) as z:
             for name in z.namelist():
@@ -655,10 +723,16 @@ def upload_zip(slug):
                 if name.startswith("__MACOSX/") or "/._" in name or name.endswith(".DS_Store"): continue
                 raw = z.read(name)
                 path = f"{target}/{name}" if target else name
-                kind = _store_uploaded_blob(repo, path, raw)
-                if kind == "binary": ok_bin += 1
-                else: ok_txt += 1
-        flash(f"Extracted ZIP into {esc(repo.slug)} — {ok_txt} text, {ok_bin} binary files")
+                try:
+                    kind = _store_uploaded_blob(repo, path, raw)
+                    if kind == "binary": ok_bin += 1
+                    else: ok_txt += 1
+                except Exception as e:
+                    errors.append(f"{name}: {e}")
+        msg = f"Extracted ZIP into {esc(repo.slug)} — {ok_txt} text, {ok_bin} binary files"
+        if errors:
+            msg += f" · {len(errors)} error(s)"
+        flash(msg)
     except Exception as e:
         flash(f"ZIP error: {e}")
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -674,8 +748,11 @@ def upload_single_file(slug):
     name = os.path.basename(up.filename)
     path = f"{target}/{name}" if target else name
     raw = up.read()
-    kind = _store_uploaded_blob(repo, path, raw)
-    flash(f"Uploaded {path} ({kind})")
+    try:
+        kind = _store_uploaded_blob(repo, path, raw)
+        flash(f"Uploaded {path} ({kind})")
+    except Exception as e:
+        flash(f"Upload failed: {e}")
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/new", methods=["POST"])
@@ -702,9 +779,10 @@ def delete_selected(slug):
     if not repo: abort(404)
     paths = request.form.getlist("paths")
     for p in paths:
-        File.query.filter(File.repo_id == repo.id,
-                          or_(File.path == p, File.path.like(p + "/%"))
-                          ).delete(synchronize_session=False)
+        for f in File.query.filter(File.repo_id == repo.id,
+                                   or_(File.path == p, File.path.like(p + "/%"))
+                                   ).all():
+            delete_file_record(f)
     db.session.commit()
     flash(f"Deleted {len(paths)} item(s)")
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -716,9 +794,10 @@ def delete_one(slug):
     if not repo: abort(404)
     p = request.args.get("path")
     if p:
-        File.query.filter(File.repo_id == repo.id,
-                          or_(File.path == p, File.path.like(p + "/%"))
-                          ).delete(synchronize_session=False)
+        for f in File.query.filter(File.repo_id == repo.id,
+                                   or_(File.path == p, File.path.like(p + "/%"))
+                                   ).all():
+            delete_file_record(f)
         db.session.commit()
         flash(f"Deleted: {p}")
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -793,8 +872,16 @@ def export_repo(slug):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for f in File.query.filter_by(repo_id=repo.id, is_dir=False).all():
-            if f.is_binary and f.blob is not None:
-                z.writestr(f.path, bytes(f.blob))
+            if f.is_binary and f.cloud_url:
+                # Fetch the actual bytes from Cloudinary
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(f.cloud_url, timeout=15) as resp:
+                        z.writestr(f.path, resp.read())
+                except Exception:
+                    # Fallback: write a small text note if download fails
+                    z.writestr(f.path,
+                        f"<!-- Could not fetch from Cloudinary: {f.cloud_url} -->")
             else:
                 z.writestr(f.path, f.content or "")
         subs = Submission.query.filter_by(repo_id=repo.id).all()

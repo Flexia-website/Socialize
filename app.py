@@ -10,7 +10,6 @@ from flask import (Flask, request, session, redirect, url_for,
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
 
-# --- Cloudinary ---
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -72,8 +71,8 @@ class File(db.Model):
     is_dir = db.Column(db.Boolean, default=False, nullable=False)
     is_binary = db.Column(db.Boolean, default=False, nullable=False)
     content = db.Column(db.Text, default="")
-    cloud_url = db.Column(db.String(1000), nullable=True)  # Cloudinary URL for binary files
-    cloud_public_id = db.Column(db.String(500), nullable=True)  # for deletion
+    cloud_url = db.Column(db.String(1000), nullable=True)
+    cloud_public_id = db.Column(db.String(500), nullable=True)
     size = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -130,7 +129,6 @@ def upsert_file(repo_id, path, content="", is_dir=False, cloud_url=None, cloud_p
     is_binary = cloud_url is not None
     final_size = size if size is not None else (len(content or "") if not is_binary else 0)
     if f:
-        # If replacing a binary file, delete old Cloudinary asset
         if f.is_binary and f.cloud_public_id and cloud_public_id is not None and f.cloud_public_id != cloud_public_id:
             try:
                 cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
@@ -154,7 +152,6 @@ def upsert_file(repo_id, path, content="", is_dir=False, cloud_url=None, cloud_p
     db.session.commit()
 
 def delete_file_record(f):
-    """Delete file record + Cloudinary asset if binary."""
     if f.is_binary and f.cloud_public_id:
         try:
             cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
@@ -162,13 +159,10 @@ def delete_file_record(f):
             pass
     db.session.delete(f)
 
-# --- Cloudinary upload helper ---
 def upload_to_cloudinary(repo, path, raw):
-    """Upload raw bytes to Cloudinary, return (url, public_id)."""
     if not cloudinary_ready:
         raise Exception("Cloudinary not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.")
     public_id = f"socialize/{repo.slug}/{path}"
-    # Strip extension from public_id (Cloudinary adds its own handling)
     result = cloudinary.uploader.upload(
         raw,
         public_id=public_id,
@@ -176,7 +170,6 @@ def upload_to_cloudinary(repo, path, raw):
         overwrite=True,
         unique_filename=False,
         use_filename=True,
-        folder=None,
     )
     return result.get("secure_url"), result.get("public_id")
 
@@ -443,6 +436,16 @@ def dashboard():
     else:
         sub_rows = '<tr><td colspan="4" class="muted">No submissions yet.</td></tr>'
 
+    if repos:
+        opts = "".join(f'<option value="{esc(r.slug)}">{esc(r.slug)}</option>' for r in repos)
+        per_repo = f"""<form method="post" action="/_submissions/clear" style="display:inline"
+                          onsubmit="return confirm('Clear all submissions for this repo?')">
+          <select name="slug" style="width:auto;padding:6px 10px;font-size:13px">{opts}</select>
+          <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear</button>
+        </form>"""
+    else:
+        per_repo = ""
+
     cdn_warn = ""
     if not cloudinary_ready:
         cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠️ Cloudinary is not configured. Binary uploads (images, PDFs) will fail. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Environment.</div>'
@@ -471,7 +474,7 @@ def dashboard():
                 onsubmit="return confirm('Delete ALL submissions? This cannot be undone.')">
             <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear All</button>
           </form>
-          {%CLEAR_PER_REPO%}
+          {per_repo}
         </div>
       </div>
       <div class="table-wrap">
@@ -482,16 +485,6 @@ def dashboard():
       </div>
     </div>
     """
-    if repos:
-        opts = "".join(f'<option value="{esc(r.slug)}">{esc(r.slug)}</option>' for r in repos)
-        per_repo = f"""<form method="post" action="/_submissions/clear" style="display:inline"
-                          onsubmit="return confirm('Clear all submissions for this repo?')">
-          <select name="slug" style="width:auto;padding:6px 10px;font-size:13px">{opts}</select>
-          <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear</button>
-        </form>"""
-    else:
-        per_repo = ""
-    body = body.replace("{%CLEAR_PER_REPO%}", per_repo)
     return page("Dashboard", body)
 
 # ---------------- submissions: delete / clear ----------------
@@ -543,7 +536,6 @@ def new_repo():
 def delete_repo(slug):
     r = get_repo(slug)
     if r:
-        # Delete Cloudinary assets for all binary files
         for f in File.query.filter_by(repo_id=r.id, is_binary=True).all():
             if f.cloud_public_id:
                 try:
@@ -559,7 +551,6 @@ def delete_repo(slug):
 
 # ---------------- public serving ----------------
 def _serve_file(f, repo):
-    # Binary: redirect to Cloudinary URL
     if f.is_binary and f.cloud_url:
         return redirect(f.cloud_url)
 
@@ -731,7 +722,7 @@ def upload_zip(slug):
                     errors.append(f"{name}: {e}")
         msg = f"Extracted ZIP into {esc(repo.slug)} — {ok_txt} text, {ok_bin} binary files"
         if errors:
-            msg += f" · {len(errors)} error(s)"
+            msg += f" · {len(errors)} error(s): " + "; ".join(errors[:3])
         flash(msg)
     except Exception as e:
         flash(f"ZIP error: {e}")
@@ -873,15 +864,12 @@ def export_repo(slug):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for f in File.query.filter_by(repo_id=repo.id, is_dir=False).all():
             if f.is_binary and f.cloud_url:
-                # Fetch the actual bytes from Cloudinary
                 try:
                     import urllib.request
                     with urllib.request.urlopen(f.cloud_url, timeout=15) as resp:
                         z.writestr(f.path, resp.read())
                 except Exception:
-                    # Fallback: write a small text note if download fails
-                    z.writestr(f.path,
-                        f"<!-- Could not fetch from Cloudinary: {f.cloud_url} -->")
+                    z.writestr(f.path, f"<!-- Cloudinary fetch failed: {f.cloud_url} -->")
             else:
                 z.writestr(f.path, f.content or "")
         subs = Submission.query.filter_by(repo_id=repo.id).all()

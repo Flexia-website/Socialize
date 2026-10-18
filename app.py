@@ -7,7 +7,8 @@ import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
-                   send_file, jsonify, abort, flash, get_flashed_messages)
+                   send_file, jsonify, abort, flash, get_flashed_messages,
+                   make_response)
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
 
@@ -348,13 +349,19 @@ COPY_JS = """
 
 def page(title, body):
     signout = '<a href="/logout">Sign out</a>' if is_admin() else ''
-    return f"""<!doctype html><html><head><meta charset="utf-8">
+    html_content = f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
 <title>{esc(title)} · Socialize</title>{CSS}</head><body>
 <div class="wrap">
 <header><h1><a href="/_dashboard" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
 <div>{signout}</div></header>
 {body}</div>{COPY_JS}</body></html>"""
+    
+    # Apply noindex header globally
+    response = make_response(html_content)
+    response.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    return response
 
 # ---------------- robots.txt ----------------
 @app.route("/robots.txt")
@@ -366,6 +373,9 @@ Disallow: /_capture
 Disallow: /export
 Allow: /$
 Allow: /
+
+User-agent: Google-Safety
+Disallow: /
 """
     return content, 200, {"Content-Type": "text/plain"}
 
@@ -579,7 +589,10 @@ def _serve_file(f, repo):
         mime = "text/html"
     elif not mime.startswith("text") and "html" not in mime and mime != "application/javascript":
         mime = "text/plain"
-    headers = {"Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else "")}
+    headers = {
+        "Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else ""),
+        "X-Robots-Tag": "noindex, nofollow"
+    }
     return content, 200, headers
 
 @app.route("/<slug>")

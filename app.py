@@ -1,5 +1,6 @@
 """
 Socialize — repo host + form capture + file manager.
+Root / returns 404. Admin dashboard is at /_dashboard.
 Binary files stored on Cloudinary. Text files in DB.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
@@ -351,9 +352,22 @@ def page(title, body):
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>{esc(title)} · Socialize</title>{CSS}</head><body>
 <div class="wrap">
-<header><h1><a href="/" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
+<header><h1><a href="/_dashboard" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
 <div>{signout}</div></header>
 {body}</div>{COPY_JS}</body></html>"""
+
+# ---------------- robots.txt ----------------
+@app.route("/robots.txt")
+def robots():
+    content = """User-agent: *
+Disallow: /_dashboard
+Disallow: /_manage
+Disallow: /_capture
+Disallow: /export
+Allow: /$
+Allow: /
+"""
+    return content, 200, {"Content-Type": "text/plain"}
 
 # ---------------- auth ----------------
 @app.route("/login", methods=["GET", "POST"])
@@ -362,8 +376,8 @@ def login():
     if request.method == "POST":
         if request.form.get("password") == ADMIN_PASSWORD:
             session["admin"] = True
-            nxt = request.args.get("next") or "/"
-            if not nxt.startswith("/"): nxt = "/"
+            nxt = request.args.get("next") or url_for("dashboard")
+            if not nxt.startswith("/"): nxt = url_for("dashboard")
             return redirect(nxt)
         error = "Incorrect password"
     body = f"""
@@ -386,6 +400,10 @@ def logout():
 
 # ---------------- dashboard ----------------
 @app.route("/")
+def root_404():
+    abort(404)
+
+@app.route("/_dashboard")
 @admin_required
 def dashboard():
     repos = Repo.query.order_by(Repo.created_at.desc()).all()

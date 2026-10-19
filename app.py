@@ -1,6 +1,9 @@
 """
 Socialize — repo host + form capture + file manager.
 Can host full static sites (like PH3D) from uploaded ZIPs.
+`/` and admin routes return 404 for non-admins (dashboard is hidden).
+Admin pages carry <meta name="robots" content="noindex, nofollow">.
+Public repo pages stay indexable.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -18,7 +21,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "socialize123")
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB (PH3D ZIP is big)
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB
 
 DATABASE_URL = "postgresql+psycopg2://neondb_owner:npg_V06GRufFMiyB@ep-still-field-b4uk713g-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
@@ -87,13 +90,19 @@ def fmt_size(n):
 
 def is_admin(): return session.get("admin") is True
 
-def admin_required(f):
+def admin_required(f, hide=False):
     @wraps(f)
     def w(*a, **k):
         if not is_admin():
+            if hide:
+                abort(404)
             return redirect(url_for("login", next=request.path))
         return f(*a, **k)
     return w
+
+def admin_hidden(f):
+    """Like admin_required, but returns 404 instead of redirecting to login."""
+    return admin_required(f, hide=True)
 
 def get_repo(slug):
     return Repo.query.filter(func.lower(Repo.slug) == slug.lower()).first()
@@ -209,10 +218,12 @@ pre{margin:0;font-size:12px;overflow:auto;max-height:220px;background:#0b1220;pa
 }
 </style>"""
 
-def page(title, body):
+def page(title, body, noindex=False):
     signout = '<a href="/logout">Sign out</a>' if is_admin() else ''
+    robots = '<meta name="robots" content="noindex, nofollow">' if noindex else ''
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+{robots}
 <title>{esc(title)} · Socialize</title>{CSS}</head><body>
 <div class="wrap">
 <header><h1><a href="/" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
@@ -240,7 +251,7 @@ def login():
         <button type="submit">Sign in</button>
       </form>
     </div>"""
-    return page("Login", body)
+    return page("Login", body, noindex=True)
 
 @app.route("/logout")
 def logout():
@@ -248,7 +259,7 @@ def logout():
     return redirect(url_for("login"))
 
 @app.route("/")
-@admin_required
+@admin_hidden
 def dashboard():
     repos = Repo.query.order_by(Repo.created_at.desc()).all()
     total_subs = Submission.query.count()
@@ -335,7 +346,7 @@ def dashboard():
       </div>
       <table><tr><th>Time</th><th>Repo</th><th>Data</th><th></th></tr>{sub_rows}</table>
     </div>"""
-    return page("Dashboard", body)
+    return page("Dashboard", body, noindex=True)
 
 @app.route("/_submissions/<int:sid>/delete", methods=["POST"])
 @admin_required
@@ -389,7 +400,7 @@ def delete_repo(slug):
         flash(f"Deleted repo: {slug}")
     return redirect(url_for("dashboard"))
 
-# ---------------- file serving (with correct MIME) ----------------
+# ---------------- file serving ----------------
 def _serve_file(f, repo):
     if f.is_binary and f.cloud_url:
         return redirect(f.cloud_url)
@@ -432,7 +443,6 @@ def serve_index(slug):
     if not repo: abort(404)
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f: return _serve_file(f, repo)
-    # Try to find ANY index.html inside the repo (handles wrapper folders)
     f = File.query.filter(File.repo_id == repo.id, File.path.like("%/index.html")).first()
     if f: return _serve_file(f, repo)
     return page(slug, '<div class="card"><h2>No index.html in this repo yet.</h2>'
@@ -445,11 +455,9 @@ def serve_path(slug, filepath):
     f = File.query.filter_by(repo_id=repo.id, path=filepath).first()
     if f:
         return _serve_file(f, repo)
-    # Try filepath + /index.html (directory index)
     f = File.query.filter_by(repo_id=repo.id, path=filepath.rstrip("/") + "/index.html").first()
     if f:
         return _serve_file(f, repo)
-    # SPA fallback: serve root index.html for unknown routes
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f:
         return _serve_file(f, repo)
@@ -469,7 +477,7 @@ def _flash_html():
     return "".join(f'<div class="flash">{esc(m)}</div>' for m in get_flashed_messages())
 
 @app.route("/_manage/<slug>")
-@admin_required
+@admin_hidden
 def manage_files(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
@@ -505,7 +513,7 @@ def manage_files(slug):
         <input name="target" placeholder="target folder (optional)">
         <button type="submit">Upload &amp; Extract</button>
       </form>
-      <p class="muted">A single top-level wrapper folder in the ZIP is stripped automatically (e.g. <code>myproject-main/</code> → files land at repo root).</p>
+      <p class="muted">A single top-level wrapper folder in the ZIP is stripped automatically.</p>
     </div>
     <div class="card">
       <h2>Upload single file</h2>
@@ -540,10 +548,9 @@ def manage_files(slug):
         <table><tr><th></th><th>Path</th><th>Size</th><th>Updated</th><th>Actions</th></tr>{rows}</table>
       </form>
     </div>"""
-    return page("Manage " + repo.slug, body)
+    return page("Manage " + repo.slug, body, noindex=True)
 
 def _store_uploaded_blob(repo, path, raw):
-    # Large files bypass the DB and go straight to Cloudinary
     if len(raw) > 500_000:
         url, public_id = upload_to_cloudinary(repo, path, raw)
         upsert_file(repo.id, path, content="", is_dir=False,
@@ -576,7 +583,6 @@ def upload_zip(slug):
                      and "/._" not in n
                      and not n.endswith(".DS_Store")]
 
-            # Detect a single common top-level folder and strip it
             top_levels = {n.split("/")[0] for n in names if "/" in n}
             prefix = ""
             if len(top_levels) == 1:
@@ -600,7 +606,7 @@ def upload_zip(slug):
 
         msg = f"Extracted — {ok_txt} text, {ok_bin} binary"
         if prefix:
-            msg += f" (stripped prefix '{prefix.rstrip('/')}/')"
+            msg += f" (stripped '{prefix.rstrip('/')}/')"
         if errors:
             msg += f" · {len(errors)} errors: " + "; ".join(errors[:3])
         flash(msg)
@@ -719,11 +725,11 @@ def edit_file(slug):
         </div>
       </form>
     </div>"""
-    return page("Edit", body)
+    return page("Edit", body, noindex=True)
 
 # ---------------- export ----------------
 @app.route("/export/<slug>")
-@admin_required
+@admin_hidden
 def export_repo(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
@@ -755,7 +761,7 @@ def export_repo(slug):
                      as_attachment=True, download_name=f"{repo.slug}.zip")
 
 @app.errorhandler(404)
-def nf(e): return page("Not found", '<div class="card"><h2>404 — Not found</h2></div>'), 404
+def nf(e): return page("Not found", '<div class="card"><h2>404 — Not found</h2></div>', noindex=True), 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

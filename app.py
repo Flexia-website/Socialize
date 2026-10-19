@@ -1,5 +1,6 @@
 """
 Socialize — repo host + form capture + file manager.
+Can host full static sites (like PH3D) from uploaded ZIPs.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -17,7 +18,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "socialize123")
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB (PH3D ZIP is big)
 
 DATABASE_URL = "postgresql+psycopg2://neondb_owner:npg_V06GRufFMiyB@ep-still-field-b4uk713g-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
 
@@ -138,6 +139,13 @@ def upload_to_cloudinary(repo, path, raw):
                                         overwrite=True, unique_filename=False, use_filename=True)
     return result.get("secure_url"), result.get("public_id")
 
+def delete_cloudinary_file(public_id):
+    if not cloudinary_ready or not public_id: return
+    try:
+        cloudinary.uploader.destroy(public_id, resource_type="auto")
+    except Exception:
+        pass
+
 _CAPTURE_JS = """
 <script>
 (function(){
@@ -172,18 +180,19 @@ def inject_capture(html_text, slug):
         return html_text.replace("</body>", script + "</body>", 1)
     return html_text + script
 
+# ---------------- CSS ----------------
 CSS = """<style>
 :root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--accent:#38bdf8;--muted:#94a3b8;--danger:#f87171;--border:#334155;--pad:24px;--radius:12px}
 *{box-sizing:border-box}
-body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
-.wrap{max-width:1000px;margin:0 auto;padding:var(--pad)}
+body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+.wrap{max-width:1100px;margin:0 auto;padding:var(--pad)}
 header{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:24px;flex-wrap:wrap}
 h1{margin:0;font-size:22px}h2{font-size:17px;margin:0 0 12px}
 .brand{color:var(--accent)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .card{background:var(--card);border-radius:var(--radius);padding:20px;margin-bottom:16px;border:1px solid var(--border)}
 input,textarea,select{font:inherit;font-size:16px;padding:12px 14px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:var(--text);width:100%}
-textarea{font-family:ui-monospace,monospace;font-size:13px;min-height:320px;resize:vertical}
-button{background:var(--accent);color:#0f172a;font-weight:600;border:none;cursor:pointer;padding:12px 20px;border-radius:8px;font-size:15px}
+textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px;min-height:320px;resize:vertical}
+button{background:var(--accent);color:#0f172a;font-weight:600;border:none;cursor:pointer;padding:12px 20px;border-radius:8px;font-size:15px;width:auto}
 button:hover{opacity:.9}button.danger{background:var(--danger);color:#fff}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .row input{flex:1;min-width:160px}
@@ -193,7 +202,11 @@ td,th{padding:10px;text-align:left;border-bottom:1px solid var(--border);font-si
 th{color:var(--muted);font-size:12px;text-transform:uppercase}
 .flash{padding:12px;background:#1e3a5f;border-radius:8px;margin-bottom:16px;border-left:4px solid var(--accent)}
 pre{margin:0;font-size:12px;overflow:auto;max-height:220px;background:#0b1220;padding:8px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
-@media (max-width:640px){.row{flex-direction:column;align-items:stretch}.row input,.row button{width:100%}}
+@media (max-width:640px){
+  .row{flex-direction:column;align-items:stretch}
+  .row input,.row button{width:100%}
+  td,th{padding:8px 6px;font-size:12px}
+}
 </style>"""
 
 def page(title, body):
@@ -281,7 +294,6 @@ def dashboard():
     else:
         sub_rows = '<tr><td colspan="4" class="muted">No submissions yet.</td></tr>'
 
-    # Build per-repo clear dropdown BEFORE the f-string
     if repos:
         opts = "".join(f'<option value="{esc(r.slug)}">{esc(r.slug)}</option>' for r in repos)
         per_repo = f"""<form method="post" action="/_submissions/clear" style="display:inline"
@@ -294,16 +306,17 @@ def dashboard():
 
     cdn_warn = ""
     if not cloudinary_ready:
-        cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠ Cloudinary not configured. Binary uploads will fail.</div>'
+        cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠ Cloudinary not configured. Binary uploads >500 KB will fail.</div>'
 
     body = f"""
     {cdn_warn}
     <div class="card">
       <h2>Create repository</h2>
       <form method="post" action="/repos/new" class="row">
-        <input name="slug" placeholder="slug (e.g. Example)" required>
+        <input name="slug" placeholder="slug (e.g. Ph3d)" required>
         <button type="submit">Create</button>
       </form>
+      <p class="muted">Then upload a ZIP from the manage page. A top-level wrapper folder is stripped automatically.</p>
     </div>
     <div class="card">
       <h2>Repositories ({len(repos)})</h2>
@@ -367,24 +380,50 @@ def new_repo():
 def delete_repo(slug):
     r = get_repo(slug)
     if r:
+        for f in File.query.filter_by(repo_id=r.id, is_binary=True).all():
+            delete_cloudinary_file(f.cloud_public_id)
         File.query.filter_by(repo_id=r.id).delete()
         Submission.query.filter_by(repo_id=r.id).delete()
         db.session.delete(r)
         db.session.commit()
+        flash(f"Deleted repo: {slug}")
     return redirect(url_for("dashboard"))
 
+# ---------------- file serving (with correct MIME) ----------------
 def _serve_file(f, repo):
     if f.is_binary and f.cloud_url:
         return redirect(f.cloud_url)
-    mime = mimetypes.guess_type(f.path)[0] or "text/plain"
+
+    path_lower = f.path.lower()
     content = f.content or ""
-    if f.path.lower().endswith((".html", ".htm")):
+
+    if path_lower.endswith((".html", ".htm")):
         content = inject_capture(content, repo.slug)
-        mime = "text/html"
-    elif not mime.startswith("text") and "html" not in mime and mime != "application/javascript":
+        return content, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+    if path_lower.endswith((".js", ".mjs")):
+        return content, 200, {"Content-Type": "application/javascript; charset=utf-8"}
+
+    if path_lower.endswith(".css"):
+        return content, 200, {"Content-Type": "text/css; charset=utf-8"}
+
+    if path_lower.endswith(".json"):
+        return content, 200, {"Content-Type": "application/json; charset=utf-8"}
+
+    if path_lower.endswith(".svg"):
+        return content, 200, {"Content-Type": "image/svg+xml"}
+
+    if path_lower.endswith(".xml"):
+        return content, 200, {"Content-Type": "application/xml; charset=utf-8"}
+
+    if path_lower.endswith(".txt"):
+        return content, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
+    mime = mimetypes.guess_type(f.path)[0] or "text/plain"
+    if not mime.startswith(("text", "image", "audio", "video")) and "javascript" not in mime:
         mime = "text/plain"
-    headers = {"Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else "")}
-    return content, 200, headers
+    charset = "; charset=utf-8" if mime.startswith("text") else ""
+    return content, 200, {"Content-Type": mime + charset}
 
 @app.route("/<slug>")
 @app.route("/<slug>/")
@@ -393,15 +432,28 @@ def serve_index(slug):
     if not repo: abort(404)
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f: return _serve_file(f, repo)
-    return page(slug, '<div class="card"><h2>No index.html yet.</h2></div>')
+    # Try to find ANY index.html inside the repo (handles wrapper folders)
+    f = File.query.filter(File.repo_id == repo.id, File.path.like("%/index.html")).first()
+    if f: return _serve_file(f, repo)
+    return page(slug, '<div class="card"><h2>No index.html in this repo yet.</h2>'
+                      f'<p class="muted">Upload a ZIP or create index.html manually.</p></div>')
 
 @app.route("/<slug>/<path:filepath>")
 def serve_path(slug, filepath):
     repo = get_repo(slug)
     if not repo: abort(404)
     f = File.query.filter_by(repo_id=repo.id, path=filepath).first()
-    if not f: abort(404)
-    return _serve_file(f, repo)
+    if f:
+        return _serve_file(f, repo)
+    # Try filepath + /index.html (directory index)
+    f = File.query.filter_by(repo_id=repo.id, path=filepath.rstrip("/") + "/index.html").first()
+    if f:
+        return _serve_file(f, repo)
+    # SPA fallback: serve root index.html for unknown routes
+    f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
+    if f:
+        return _serve_file(f, repo)
+    abort(404)
 
 @app.route("/_capture/<slug>", methods=["POST"])
 def capture(slug):
@@ -412,6 +464,7 @@ def capture(slug):
     db.session.commit()
     return jsonify(ok=True)
 
+# ---------------- file manager ----------------
 def _flash_html():
     return "".join(f'<div class="flash">{esc(m)}</div>' for m in get_flashed_messages())
 
@@ -429,19 +482,20 @@ def manage_files(slug):
         edit = f'<a href="/_manage/{esc(repo.slug)}/edit?path={esc(f.path)}">Edit</a> · ' if (not f.is_dir and not f.is_binary) else ''
         view = f'<a href="/{esc(repo.slug)}/{esc(f.path)}" target="_blank">View</a> · ' if not f.is_dir else ''
         rows += f"""<tr>
-          <td><input type="checkbox" name="paths" value="{esc(f.path)}"></td>
+          <td><input type="checkbox" name="paths" value="{esc(f.path)}" style="width:auto"></td>
           <td>{icon} {disp}</td>
           <td class="muted">{fmt_size(f.size)}</td>
+          <td class="muted">{f.updated_at.strftime('%Y-%m-%d %H:%M') if f.updated_at else ''}</td>
           <td>{edit}{view}<a href="/_manage/{esc(repo.slug)}/delete-one?path={esc(f.path)}"
-              onclick="return confirm('Delete?')">Delete</a></td>
+              onclick="return confirm('Delete {esc(f.path)}?')">Delete</a></td>
         </tr>"""
     if not files:
-        rows = '<tr><td colspan="4" class="muted">No files.</td></tr>'
+        rows = '<tr><td colspan="5" class="muted">No files. Upload a ZIP or create one.</td></tr>'
 
     body = f"""
     {_flash_html()}
     <div class="card">
-      <h2>{esc(repo.slug)}</h2>
+      <h2>{esc(repo.slug)} · File Manager</h2>
       <p class="muted">Public URL: <a href="/{esc(repo.slug)}" target="_blank">/{esc(repo.slug)}</a></p>
     </div>
     <div class="card">
@@ -451,6 +505,7 @@ def manage_files(slug):
         <input name="target" placeholder="target folder (optional)">
         <button type="submit">Upload &amp; Extract</button>
       </form>
+      <p class="muted">A single top-level wrapper folder in the ZIP is stripped automatically (e.g. <code>myproject-main/</code> → files land at repo root).</p>
     </div>
     <div class="card">
       <h2>Upload single file</h2>
@@ -482,12 +537,18 @@ def manage_files(slug):
           <button type="submit" formaction="/_manage/{esc(repo.slug)}/delete"
                   class="danger" onclick="return confirm('Delete selected?')">Delete Selected</button>
         </div>
-        <table><tr><th></th><th>Path</th><th>Size</th><th>Actions</th></tr>{rows}</table>
+        <table><tr><th></th><th>Path</th><th>Size</th><th>Updated</th><th>Actions</th></tr>{rows}</table>
       </form>
     </div>"""
     return page("Manage " + repo.slug, body)
 
 def _store_uploaded_blob(repo, path, raw):
+    # Large files bypass the DB and go straight to Cloudinary
+    if len(raw) > 500_000:
+        url, public_id = upload_to_cloudinary(repo, path, raw)
+        upsert_file(repo.id, path, content="", is_dir=False,
+                    cloud_url=url, cloud_public_id=public_id, size=len(raw))
+        return "binary"
     try:
         text = raw.decode("utf-8")
         upsert_file(repo.id, path, text, is_dir=False)
@@ -506,18 +567,43 @@ def upload_zip(slug):
     up = request.files.get("zip")
     if not up: abort(400)
     target = (request.form.get("target") or "").strip().strip("/")
-    ok_txt = ok_bin = 0
+
     try:
         with zipfile.ZipFile(up.stream) as z:
-            for name in z.namelist():
-                if name.endswith("/"): continue
-                if name.startswith("__MACOSX/") or "/._" in name or name.endswith(".DS_Store"): continue
+            names = [n for n in z.namelist()
+                     if not n.endswith("/")
+                     and not n.startswith("__MACOSX/")
+                     and "/._" not in n
+                     and not n.endswith(".DS_Store")]
+
+            # Detect a single common top-level folder and strip it
+            top_levels = {n.split("/")[0] for n in names if "/" in n}
+            prefix = ""
+            if len(top_levels) == 1:
+                candidate = top_levels.pop()
+                if all(n.startswith(candidate + "/") for n in names):
+                    prefix = candidate + "/"
+
+            ok_txt = ok_bin = 0
+            errors = []
+            for name in names:
                 raw = z.read(name)
-                path = f"{target}/{name}" if target else name
-                kind = _store_uploaded_blob(repo, path, raw)
-                if kind == "binary": ok_bin += 1
-                else: ok_txt += 1
-        flash(f"Extracted — {ok_txt} text, {ok_bin} binary")
+                rel = name[len(prefix):] if prefix else name
+                if not rel: continue
+                path = f"{target}/{rel}" if target else rel
+                try:
+                    kind = _store_uploaded_blob(repo, path, raw)
+                    if kind == "binary": ok_bin += 1
+                    else: ok_txt += 1
+                except Exception as e:
+                    errors.append(f"{rel}: {e}")
+
+        msg = f"Extracted — {ok_txt} text, {ok_bin} binary"
+        if prefix:
+            msg += f" (stripped prefix '{prefix.rstrip('/')}/')"
+        if errors:
+            msg += f" · {len(errors)} errors: " + "; ".join(errors[:3])
+        flash(msg)
     except Exception as e:
         flash(f"ZIP error: {e}")
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -549,7 +635,7 @@ def new_item(slug):
     if not path:
         flash("Path required"); return redirect(url_for("manage_files", slug=repo.slug))
     if File.query.filter_by(repo_id=repo.id, path=path).first():
-        flash(f"Already exists"); return redirect(url_for("manage_files", slug=repo.slug))
+        flash("Already exists"); return redirect(url_for("manage_files", slug=repo.slug))
     upsert_file(repo.id, path, "", is_dir=(kind == "folder"))
     if kind == "file":
         return redirect(url_for("edit_file", slug=repo.slug, path=path))
@@ -561,8 +647,11 @@ def delete_selected(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
     for p in request.form.getlist("paths"):
-        File.query.filter(File.repo_id == repo.id,
-                          or_(File.path == p, File.path.like(p + "/%"))).delete(synchronize_session=False)
+        for f in File.query.filter(File.repo_id == repo.id,
+                                    or_(File.path == p, File.path.like(p + "/%"))).all():
+            if f.is_binary:
+                delete_cloudinary_file(f.cloud_public_id)
+            db.session.delete(f)
     db.session.commit()
     return redirect(url_for("manage_files", slug=repo.slug))
 
@@ -573,9 +662,13 @@ def delete_one(slug):
     if not repo: abort(404)
     p = request.args.get("path")
     if p:
-        File.query.filter(File.repo_id == repo.id,
-                          or_(File.path == p, File.path.like(p + "/%"))).delete(synchronize_session=False)
+        for f in File.query.filter(File.repo_id == repo.id,
+                                    or_(File.path == p, File.path.like(p + "/%"))).all():
+            if f.is_binary:
+                delete_cloudinary_file(f.cloud_public_id)
+            db.session.delete(f)
         db.session.commit()
+        flash(f"Deleted: {p}")
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/move", methods=["POST"])
@@ -611,7 +704,7 @@ def edit_file(slug):
         f.size = len(f.content)
         f.updated_at = datetime.utcnow()
         db.session.commit()
-        flash(f"Saved")
+        flash("Saved")
         return redirect(url_for("edit_file", slug=repo.slug, path=path))
     body = f"""
     {_flash_html()}
@@ -628,6 +721,7 @@ def edit_file(slug):
     </div>"""
     return page("Edit", body)
 
+# ---------------- export ----------------
 @app.route("/export/<slug>")
 @admin_required
 def export_repo(slug):
@@ -661,7 +755,7 @@ def export_repo(slug):
                      as_attachment=True, download_name=f"{repo.slug}.zip")
 
 @app.errorhandler(404)
-def nf(e): return page("Not found", '<div class="card"><h2>404</h2></div>'), 404
+def nf(e): return page("Not found", '<div class="card"><h2>404 — Not found</h2></div>'), 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

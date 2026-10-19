@@ -1,20 +1,16 @@
 """
 Socialize — repo host + form capture + file manager.
-Root / returns 404. Admin dashboard is at /_dashboard.
-Binary files stored on Cloudinary. Text files in DB.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
 from functools import wraps
 from flask import (Flask, request, session, redirect, url_for,
-                   send_file, jsonify, abort, flash, get_flashed_messages,
-                   make_response)
+                   send_file, jsonify, abort, flash, get_flashed_messages)
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, or_
 
 import cloudinary
 import cloudinary.uploader
-import cloudinary.api
 
 # ---------------- config ----------------
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -33,29 +29,18 @@ if db_url.startswith("postgresql://"):
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_pre_ping": True,
-    "pool_recycle": 280,
-}
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
 db = SQLAlchemy(app)
 
-# --- Cloudinary config ---
 CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUD_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
 CLOUD_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
 
 cloudinary_ready = False
 if CLOUD_NAME and CLOUD_API_KEY and CLOUD_API_SECRET:
-    try:
-        cloudinary.config(
-            cloud_name=CLOUD_NAME,
-            api_key=CLOUD_API_KEY,
-            api_secret=CLOUD_API_SECRET,
-            secure=True,
-        )
-        cloudinary_ready = True
-    except Exception as e:
-        print(f"Cloudinary init warning: {e}")
+    cloudinary.config(cloud_name=CLOUD_NAME, api_key=CLOUD_API_KEY,
+                      api_secret=CLOUD_API_SECRET, secure=True)
+    cloudinary_ready = True
 
 # ---------------- models ----------------
 class Repo(db.Model):
@@ -131,11 +116,6 @@ def upsert_file(repo_id, path, content="", is_dir=False, cloud_url=None, cloud_p
     is_binary = cloud_url is not None
     final_size = size if size is not None else (len(content or "") if not is_binary else 0)
     if f:
-        if f.is_binary and f.cloud_public_id and cloud_public_id is not None and f.cloud_public_id != cloud_public_id:
-            try:
-                cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
-            except Exception:
-                pass
         f.content = "" if is_binary else (content or "")
         f.cloud_url = cloud_url
         f.cloud_public_id = cloud_public_id
@@ -144,38 +124,20 @@ def upsert_file(repo_id, path, content="", is_dir=False, cloud_url=None, cloud_p
         f.is_dir = is_dir
         f.updated_at = datetime.utcnow()
     else:
-        db.session.add(File(
-            repo_id=repo_id, path=path,
-            content="" if is_binary else (content or ""),
-            cloud_url=cloud_url, cloud_public_id=cloud_public_id,
-            is_binary=is_binary,
-            size=final_size, is_dir=is_dir,
-        ))
+        db.session.add(File(repo_id=repo_id, path=path,
+                            content="" if is_binary else (content or ""),
+                            cloud_url=cloud_url, cloud_public_id=cloud_public_id,
+                            is_binary=is_binary, size=final_size, is_dir=is_dir))
     db.session.commit()
-
-def delete_file_record(f):
-    if f.is_binary and f.cloud_public_id:
-        try:
-            cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
-        except Exception:
-            pass
-    db.session.delete(f)
 
 def upload_to_cloudinary(repo, path, raw):
     if not cloudinary_ready:
-        raise Exception("Cloudinary not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.")
+        raise Exception("Cloudinary not configured")
     public_id = f"socialize/{repo.slug}/{path}"
-    result = cloudinary.uploader.upload(
-        raw,
-        public_id=public_id,
-        resource_type="auto",
-        overwrite=True,
-        unique_filename=False,
-        use_filename=True,
-    )
+    result = cloudinary.uploader.upload(raw, public_id=public_id, resource_type="auto",
+                                        overwrite=True, unique_filename=False, use_filename=True)
     return result.get("secure_url"), result.get("public_id")
 
-# SAFE field IDs — no "password", no "user-name", no "phone-email"
 _CAPTURE_JS = """
 <script>
 (function(){
@@ -194,9 +156,9 @@ _CAPTURE_JS = """
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify(data)
       }).then(function(r){
-        if(r.ok){ f.reset(); alert('Thanks! Submitted.'); }
-        else alert('Error, please try again.');
-      }).catch(function(){ alert('Error, please try again.'); });
+        if(r.ok){ f.reset(); alert('Submitted.'); }
+        else alert('Error');
+      }).catch(function(){ alert('Error'); });
     });
   });
 })();
@@ -210,184 +172,49 @@ def inject_capture(html_text, slug):
         return html_text.replace("</body>", script + "</body>", 1)
     return html_text + script
 
-# ---------------- responsive CSS ----------------
 CSS = """<style>
-:root{
-  --bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--accent:#38bdf8;
-  --muted:#94a3b8;--danger:#f87171;--border:#334155;
-  --pad:24px;--radius:12px;
-}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{-webkit-text-size-adjust:100%}
-body{
-  margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-  background:var(--bg);color:var(--text);line-height:1.5;
-  padding:env(safe-area-inset-top) env(safe-area-inset-right)
-          env(safe-area-inset-bottom) env(safe-area-inset-left);
-}
+:root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--accent:#38bdf8;--muted:#94a3b8;--danger:#f87171;--border:#334155;--pad:24px;--radius:12px}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
 .wrap{max-width:1000px;margin:0 auto;padding:var(--pad)}
-header{
-  display:flex;justify-content:space-between;align-items:center;
-  gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);
-  margin-bottom:24px;flex-wrap:wrap;
-}
-h1{margin:0;font-size:22px}
-h2{font-size:17px;margin:0 0 12px;line-height:1.3}
-.brand{color:var(--accent)}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-.card{
-  background:var(--card);border-radius:var(--radius);padding:20px;
-  margin-bottom:16px;border:1px solid var(--border);
-}
-input,textarea,select{
-  font:inherit;font-size:16px;
-  padding:12px 14px;border-radius:8px;border:1px solid #475569;
-  background:#0f172a;color:var(--text);width:100%;max-width:100%;
-}
-textarea{
-  font-family:ui-monospace,Menlo,monospace;font-size:13px;
-  min-height:320px;resize:vertical;
-}
-button{
-  background:var(--accent);color:#0f172a;font-weight:600;border:none;
-  cursor:pointer;width:auto;padding:12px 20px;border-radius:8px;
-  font-size:15px;min-height:44px;touch-action:manipulation;
-}
-button:hover{opacity:.9}
-button:active{transform:scale(.98)}
-button.danger{background:var(--danger);color:#fff}
-button.copy{background:#475569;color:#fff}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:24px;flex-wrap:wrap}
+h1{margin:0;font-size:22px}h2{font-size:17px;margin:0 0 12px}
+.brand{color:var(--accent)}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.card{background:var(--card);border-radius:var(--radius);padding:20px;margin-bottom:16px;border:1px solid var(--border)}
+input,textarea,select{font:inherit;font-size:16px;padding:12px 14px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:var(--text);width:100%}
+textarea{font-family:ui-monospace,monospace;font-size:13px;min-height:320px;resize:vertical}
+button{background:var(--accent);color:#0f172a;font-weight:600;border:none;cursor:pointer;padding:12px 20px;border-radius:8px;font-size:15px}
+button:hover{opacity:.9}button.danger{background:var(--danger);color:#fff}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
 .row input{flex:1;min-width:160px}
 .muted{color:var(--muted);font-size:14px}
-.table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;margin-top:8px}
-table{width:100%;border-collapse:collapse;min-width:520px}
-td,th{
-  padding:10px;text-align:left;border-bottom:1px solid var(--border);
-  font-size:14px;vertical-align:middle;
-}
-th{
-  color:var(--muted);font-weight:500;font-size:12px;
-  text-transform:uppercase;white-space:nowrap;
-}
-tr:hover td{background:rgba(56,189,248,.05)}
-.flash{
-  padding:12px;background:#1e3a5f;border-radius:8px;
-  margin-bottom:16px;border-left:4px solid var(--accent);
-}
-pre{
-  margin:0;font-size:12px;overflow:auto;max-height:220px;
-  background:#0b1220;padding:8px;border-radius:6px;
-  white-space:pre-wrap;word-break:break-word;
-}
-.sub-actions{display:flex;gap:6px;flex-wrap:wrap}
-.sub-actions button{padding:4px 10px;font-size:12px;min-height:0}
-@media (max-width:640px){
-  :root{--pad:14px;--radius:10px}
-  body{font-size:15px}
-  h1{font-size:19px}
-  h2{font-size:16px;margin-bottom:10px}
-  .card{padding:14px;margin-bottom:12px}
-  .row{flex-direction:column;align-items:stretch;gap:8px}
-  .row input,.row button,.row select{width:100%;min-width:0}
-  header{flex-direction:row;flex-wrap:wrap;gap:8px}
-  header h1{font-size:18px;flex:1 1 100%}
-  header > div{width:100%;text-align:right;font-size:14px}
-  form .row button{width:100%}
-  table{min-width:0;font-size:13px}
-  td,th{padding:8px 6px}
-  th{font-size:11px}
-  td form{display:inline}
-  td form button{padding:4px 10px;font-size:12px;min-height:32px}
-  textarea{min-height:50vh;font-size:14px}
-  table input[type=checkbox]{width:20px;height:20px;margin:0;vertical-align:middle}
-  pre{font-size:11px;max-height:160px}
-  .card[style*="margin:60px"]{margin:24px auto !important}
-}
-@media (max-width:380px){
-  :root{--pad:10px}
-  h1{font-size:17px}
-  button{padding:10px 14px;font-size:14px}
-  .card{padding:12px}
-}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+td,th{padding:10px;text-align:left;border-bottom:1px solid var(--border);font-size:14px}
+th{color:var(--muted);font-size:12px;text-transform:uppercase}
+.flash{padding:12px;background:#1e3a5f;border-radius:8px;margin-bottom:16px;border-left:4px solid var(--accent)}
+pre{margin:0;font-size:12px;overflow:auto;max-height:220px;background:#0b1220;padding:8px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
+@media (max-width:640px){.row{flex-direction:column;align-items:stretch}.row input,.row button{width:100%}}
 </style>"""
-
-COPY_JS = """
-<script>
-(function(){
-  document.addEventListener('click', function(e){
-    var b = e.target.closest('.copy-btn');
-    if(!b) return;
-    var el = document.getElementById('sub-' + b.dataset.id);
-    var text = el ? el.textContent : '';
-    var done = function(){
-      var old = b.textContent;
-      b.textContent = 'Copied!';
-      setTimeout(function(){ b.textContent = old; }, 1200);
-    };
-    if(navigator.clipboard && navigator.clipboard.writeText){
-      navigator.clipboard.writeText(text).then(done).catch(function(){
-        fallbackCopy(text); done();
-      });
-    } else {
-      fallbackCopy(text); done();
-    }
-  });
-  function fallbackCopy(text){
-    var ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position='fixed'; ta.style.top='-9999px';
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); } catch(e){}
-    document.body.removeChild(ta);
-  }
-})();
-</script>
-"""
 
 def page(title, body):
     signout = '<a href="/logout">Sign out</a>' if is_admin() else ''
-    html_content = f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="robots" content="noindex, nofollow">
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} · Socialize</title>{CSS}</head><body>
 <div class="wrap">
-<header><h1><a href="/_dashboard" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
+<header><h1><a href="/" style="color:inherit;text-decoration:none"><span class="brand">Socialize</span></a></h1>
 <div>{signout}</div></header>
-{body}</div>{COPY_JS}</body></html>"""
-    
-    # Apply noindex header globally
-    response = make_response(html_content)
-    response.headers['X-Robots-Tag'] = 'noindex, nofollow'
-    return response
+{body}</div></body></html>"""
 
-# ---------------- robots.txt ----------------
-@app.route("/robots.txt")
-def robots():
-    content = """User-agent: *
-Disallow: /_dashboard
-Disallow: /_manage
-Disallow: /_capture
-Disallow: /export
-Allow: /$
-Allow: /
-
-User-agent: Google-Safety
-Disallow: /
-"""
-    return content, 200, {"Content-Type": "text/plain"}
-
-# ---------------- auth ----------------
+# ---------------- routes ----------------
 @app.route("/login", methods=["GET", "POST"])
 def login():
     error = None
     if request.method == "POST":
         if request.form.get("password") == ADMIN_PASSWORD:
             session["admin"] = True
-            nxt = request.args.get("next") or url_for("dashboard")
-            if not nxt.startswith("/"): nxt = url_for("dashboard")
+            nxt = request.args.get("next") or "/"
+            if not nxt.startswith("/"): nxt = "/"
             return redirect(nxt)
         error = "Incorrect password"
     body = f"""
@@ -399,8 +226,7 @@ def login():
         <div style="height:12px"></div>
         <button type="submit">Sign in</button>
       </form>
-    </div>
-    """
+    </div>"""
     return page("Login", body)
 
 @app.route("/logout")
@@ -408,12 +234,7 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-# ---------------- dashboard ----------------
 @app.route("/")
-def root_404():
-    abort(404)
-
-@app.route("/_dashboard")
 @admin_required
 def dashboard():
     repos = Repo.query.order_by(Repo.created_at.desc()).all()
@@ -433,7 +254,7 @@ def dashboard():
                 <a href="/export/{esc(r.slug)}">Export ZIP</a> ·
                 <form method="post" action="/repos/{esc(r.slug)}/delete" style="display:inline"
                       onsubmit="return confirm('Delete repo and all files?')">
-                  <button class="danger" style="padding:3px 10px;font-size:12px;min-height:0">Delete</button>
+                  <button class="danger" style="padding:3px 10px;font-size:12px">Delete</button>
                 </form>
               </td></tr>"""
     else:
@@ -450,33 +271,30 @@ def dashboard():
             sub_rows += f"""<tr>
               <td class="muted">{s.created_at.strftime('%Y-%m-%d %H:%M')}</td>
               <td>{esc(rr.slug if rr else '?')}</td>
-              <td><pre id="sub-{s.id}">{esc(txt)}</pre></td>
+              <td><pre>{esc(txt)}</pre></td>
               <td>
-                <div class="sub-actions">
-                  <button type="button" class="copy-btn copy" data-id="{s.id}">Copy</button>
-                  <form method="post" action="/_submissions/{s.id}/delete" style="display:inline"
-                        onsubmit="return confirm('Delete this submission?')">
-                    <button class="danger">Delete</button>
-                  </form>
-                </div>
-              </td>
-            </tr>"""
+                <form method="post" action="/_submissions/{s.id}/delete" style="display:inline"
+                      onsubmit="return confirm('Delete this submission?')">
+                  <button class="danger" style="padding:3px 10px;font-size:12px">Delete</button>
+                </form>
+              </td></tr>"""
     else:
         sub_rows = '<tr><td colspan="4" class="muted">No submissions yet.</td></tr>'
 
+    # Build per-repo clear dropdown BEFORE the f-string
     if repos:
         opts = "".join(f'<option value="{esc(r.slug)}">{esc(r.slug)}</option>' for r in repos)
         per_repo = f"""<form method="post" action="/_submissions/clear" style="display:inline"
                           onsubmit="return confirm('Clear all submissions for this repo?')">
-          <select name="slug" style="width:auto;padding:6px 10px;font-size:13px">{opts}</select>
-          <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear</button>
+          <select name="slug" style="width:auto;padding:6px 10px">{opts}</select>
+          <button class="danger" style="padding:6px 14px;font-size:13px">Clear</button>
         </form>"""
     else:
         per_repo = ""
 
     cdn_warn = ""
     if not cloudinary_ready:
-        cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠️ Cloudinary is not configured. Binary uploads (images, PDFs) will fail. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Environment.</div>'
+        cdn_warn = '<div class="flash" style="background:#7c2d12;border-left-color:#f87171">⚠ Cloudinary not configured. Binary uploads will fail.</div>'
 
     body = f"""
     {cdn_warn}
@@ -486,36 +304,26 @@ def dashboard():
         <input name="slug" placeholder="slug (e.g. Example)" required>
         <button type="submit">Create</button>
       </form>
-      <p class="muted">Public URL will be <code>/slug</code>. Then upload a ZIP from the manage page.</p>
     </div>
     <div class="card">
       <h2>Repositories ({len(repos)})</h2>
-      <div class="table-wrap">
-        <table><tr><th>Slug</th><th>Files</th><th>Submissions</th><th>Actions</th></tr>{repo_rows}</table>
-      </div>
+      <table><tr><th>Slug</th><th>Files</th><th>Subs</th><th>Actions</th></tr>{repo_rows}</table>
     </div>
     <div class="card" id="subs">
       <div class="row" style="justify-content:space-between">
-        <h2 style="margin:0">Recent submissions ({total_subs} total)</h2>
+        <h2 style="margin:0">Submissions ({total_subs})</h2>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
           <form method="post" action="/_submissions/clear" style="display:inline"
-                onsubmit="return confirm('Delete ALL submissions? This cannot be undone.')">
-            <button class="danger" style="padding:6px 14px;font-size:13px;min-height:0">Clear All</button>
+                onsubmit="return confirm('Delete ALL submissions?')">
+            <button class="danger" style="padding:6px 14px;font-size:13px">Clear All</button>
           </form>
           {per_repo}
         </div>
       </div>
-      <div class="table-wrap">
-        <table>
-          <tr><th>Time</th><th>Repo</th><th>Data</th><th>Actions</th></tr>
-          {sub_rows}
-        </table>
-      </div>
-    </div>
-    """
+      <table><tr><th>Time</th><th>Repo</th><th>Data</th><th></th></tr>{sub_rows}</table>
+    </div>"""
     return page("Dashboard", body)
 
-# ---------------- submissions: delete / clear ----------------
 @app.route("/_submissions/<int:sid>/delete", methods=["POST"])
 @admin_required
 def delete_submission(sid):
@@ -523,7 +331,6 @@ def delete_submission(sid):
     if s:
         db.session.delete(s)
         db.session.commit()
-        flash("Submission deleted")
     return redirect(url_for("dashboard") + "#subs")
 
 @app.route("/_submissions/clear", methods=["POST"])
@@ -533,15 +340,11 @@ def clear_submissions():
     if slug:
         repo = get_repo(slug)
         if repo:
-            n = Submission.query.filter_by(repo_id=repo.id).delete()
+            Submission.query.filter_by(repo_id=repo.id).delete()
             db.session.commit()
-            flash(f"Cleared {n} submission(s) for {slug}")
-        else:
-            flash("Repo not found")
     else:
-        n = Submission.query.delete()
+        Submission.query.delete()
         db.session.commit()
-        flash(f"Cleared all {n} submissions")
     return redirect(url_for("dashboard") + "#subs")
 
 @app.route("/repos/new", methods=["POST"])
@@ -549,7 +352,7 @@ def clear_submissions():
 def new_repo():
     slug = (request.form.get("slug") or "").strip()
     if not slug or "/" in slug or slug.startswith("_"):
-        flash("Invalid slug (no slashes, cannot start with _)")
+        flash("Invalid slug")
         return redirect(url_for("dashboard"))
     if get_repo(slug):
         flash("Slug already exists")
@@ -564,24 +367,15 @@ def new_repo():
 def delete_repo(slug):
     r = get_repo(slug)
     if r:
-        for f in File.query.filter_by(repo_id=r.id, is_binary=True).all():
-            if f.cloud_public_id:
-                try:
-                    cloudinary.uploader.destroy(f.cloud_public_id, resource_type="auto")
-                except Exception:
-                    pass
         File.query.filter_by(repo_id=r.id).delete()
         Submission.query.filter_by(repo_id=r.id).delete()
         db.session.delete(r)
         db.session.commit()
-        flash(f"Deleted repo: {slug}")
     return redirect(url_for("dashboard"))
 
-# ---------------- public serving ----------------
 def _serve_file(f, repo):
     if f.is_binary and f.cloud_url:
         return redirect(f.cloud_url)
-
     mime = mimetypes.guess_type(f.path)[0] or "text/plain"
     content = f.content or ""
     if f.path.lower().endswith((".html", ".htm")):
@@ -589,10 +383,7 @@ def _serve_file(f, repo):
         mime = "text/html"
     elif not mime.startswith("text") and "html" not in mime and mime != "application/javascript":
         mime = "text/plain"
-    headers = {
-        "Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else ""),
-        "X-Robots-Tag": "noindex, nofollow"
-    }
+    headers = {"Content-Type": mime + ("; charset=utf-8" if mime.startswith("text") or "html" in mime or "javascript" in mime else "")}
     return content, 200, headers
 
 @app.route("/<slug>")
@@ -602,24 +393,16 @@ def serve_index(slug):
     if not repo: abort(404)
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f: return _serve_file(f, repo)
-    files = File.query.filter_by(repo_id=repo.id, is_dir=False).order_by(File.path).all()
-    listing = "".join(f'<li><a href="/{esc(repo.slug)}/{esc(x.path)}">{esc(x.path)}</a></li>' for x in files)
-    body = f"""<div class="card"><h2>{esc(repo.slug)}</h2>
-      <p class="muted">No index.html yet.</p>
-      {'<ul>'+listing+'</ul>' if listing else ''}</div>"""
-    return page(repo.slug, body)
+    return page(slug, '<div class="card"><h2>No index.html yet.</h2></div>')
 
 @app.route("/<slug>/<path:filepath>")
 def serve_path(slug, filepath):
     repo = get_repo(slug)
     if not repo: abort(404)
     f = File.query.filter_by(repo_id=repo.id, path=filepath).first()
-    if not f:
-        f = File.query.filter_by(repo_id=repo.id, path=filepath.rstrip("/") + "/index.html").first()
     if not f: abort(404)
     return _serve_file(f, repo)
 
-# ---------------- form capture ----------------
 @app.route("/_capture/<slug>", methods=["POST"])
 def capture(slug):
     repo = get_repo(slug)
@@ -629,12 +412,8 @@ def capture(slug):
     db.session.commit()
     return jsonify(ok=True)
 
-# ---------------- file manager ----------------
 def _flash_html():
-    out = ""
-    for m in get_flashed_messages():
-        out += f'<div class="flash">{esc(m)}</div>'
-    return out
+    return "".join(f'<div class="flash">{esc(m)}</div>' for m in get_flashed_messages())
 
 @app.route("/_manage/<slug>")
 @admin_required
@@ -645,27 +424,24 @@ def manage_files(slug):
 
     rows = ""
     for f in files:
-        if f.is_dir: icon = "📁"
-        elif f.is_binary: icon = "🖼️"
-        else: icon = "📄"
+        icon = "📁" if f.is_dir else ("🖼️" if f.is_binary else "📄")
         disp = esc(f.path) + ("/" if f.is_dir else "")
         edit = f'<a href="/_manage/{esc(repo.slug)}/edit?path={esc(f.path)}">Edit</a> · ' if (not f.is_dir and not f.is_binary) else ''
         view = f'<a href="/{esc(repo.slug)}/{esc(f.path)}" target="_blank">View</a> · ' if not f.is_dir else ''
         rows += f"""<tr>
-          <td><input type="checkbox" name="paths" value="{esc(f.path)}" style="width:auto"></td>
+          <td><input type="checkbox" name="paths" value="{esc(f.path)}"></td>
           <td>{icon} {disp}</td>
           <td class="muted">{fmt_size(f.size)}</td>
-          <td class="muted">{f.updated_at.strftime('%Y-%m-%d %H:%M') if f.updated_at else ''}</td>
           <td>{edit}{view}<a href="/_manage/{esc(repo.slug)}/delete-one?path={esc(f.path)}"
-              onclick="return confirm('Delete {esc(f.path)}?')">Delete</a></td>
+              onclick="return confirm('Delete?')">Delete</a></td>
         </tr>"""
     if not files:
-        rows = '<tr><td colspan="5" class="muted">No files. Upload a ZIP or create one.</td></tr>'
+        rows = '<tr><td colspan="4" class="muted">No files.</td></tr>'
 
     body = f"""
     {_flash_html()}
     <div class="card">
-      <h2>{esc(repo.slug)} · File Manager</h2>
+      <h2>{esc(repo.slug)}</h2>
       <p class="muted">Public URL: <a href="/{esc(repo.slug)}" target="_blank">/{esc(repo.slug)}</a></p>
     </div>
     <div class="card">
@@ -687,7 +463,7 @@ def manage_files(slug):
     <div class="card">
       <h2>Create</h2>
       <form method="post" action="/_manage/{esc(repo.slug)}/new" class="row">
-        <input name="path" placeholder="path (e.g. index.html or js/app.js)" required>
+        <input name="path" placeholder="path (e.g. index.html)" required>
         <input type="hidden" name="kind" value="file">
         <button type="submit">New File</button>
       </form>
@@ -706,15 +482,9 @@ def manage_files(slug):
           <button type="submit" formaction="/_manage/{esc(repo.slug)}/delete"
                   class="danger" onclick="return confirm('Delete selected?')">Delete Selected</button>
         </div>
-        <div class="table-wrap">
-          <table>
-            <tr><th></th><th>Path</th><th>Size</th><th>Updated</th><th>Actions</th></tr>
-            {rows}
-          </table>
-        </div>
+        <table><tr><th></th><th>Path</th><th>Size</th><th>Actions</th></tr>{rows}</table>
       </form>
-    </div>
-    """
+    </div>"""
     return page("Manage " + repo.slug, body)
 
 def _store_uploaded_blob(repo, path, raw):
@@ -737,7 +507,6 @@ def upload_zip(slug):
     if not up: abort(400)
     target = (request.form.get("target") or "").strip().strip("/")
     ok_txt = ok_bin = 0
-    errors = []
     try:
         with zipfile.ZipFile(up.stream) as z:
             for name in z.namelist():
@@ -745,16 +514,10 @@ def upload_zip(slug):
                 if name.startswith("__MACOSX/") or "/._" in name or name.endswith(".DS_Store"): continue
                 raw = z.read(name)
                 path = f"{target}/{name}" if target else name
-                try:
-                    kind = _store_uploaded_blob(repo, path, raw)
-                    if kind == "binary": ok_bin += 1
-                    else: ok_txt += 1
-                except Exception as e:
-                    errors.append(f"{name}: {e}")
-        msg = f"Extracted ZIP into {esc(repo.slug)} — {ok_txt} text, {ok_bin} binary files"
-        if errors:
-            msg += f" · {len(errors)} error(s): " + "; ".join(errors[:3])
-        flash(msg)
+                kind = _store_uploaded_blob(repo, path, raw)
+                if kind == "binary": ok_bin += 1
+                else: ok_txt += 1
+        flash(f"Extracted — {ok_txt} text, {ok_bin} binary")
     except Exception as e:
         flash(f"ZIP error: {e}")
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -769,9 +532,8 @@ def upload_single_file(slug):
     target = (request.form.get("target") or "").strip().strip("/")
     name = os.path.basename(up.filename)
     path = f"{target}/{name}" if target else name
-    raw = up.read()
     try:
-        kind = _store_uploaded_blob(repo, path, raw)
+        kind = _store_uploaded_blob(repo, path, up.read())
         flash(f"Uploaded {path} ({kind})")
     except Exception as e:
         flash(f"Upload failed: {e}")
@@ -787,9 +549,8 @@ def new_item(slug):
     if not path:
         flash("Path required"); return redirect(url_for("manage_files", slug=repo.slug))
     if File.query.filter_by(repo_id=repo.id, path=path).first():
-        flash(f"Already exists: {path}"); return redirect(url_for("manage_files", slug=repo.slug))
+        flash(f"Already exists"); return redirect(url_for("manage_files", slug=repo.slug))
     upsert_file(repo.id, path, "", is_dir=(kind == "folder"))
-    flash(f"Created {kind}: {path}")
     if kind == "file":
         return redirect(url_for("edit_file", slug=repo.slug, path=path))
     return redirect(url_for("manage_files", slug=repo.slug))
@@ -799,14 +560,10 @@ def new_item(slug):
 def delete_selected(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
-    paths = request.form.getlist("paths")
-    for p in paths:
-        for f in File.query.filter(File.repo_id == repo.id,
-                                   or_(File.path == p, File.path.like(p + "/%"))
-                                   ).all():
-            delete_file_record(f)
+    for p in request.form.getlist("paths"):
+        File.query.filter(File.repo_id == repo.id,
+                          or_(File.path == p, File.path.like(p + "/%"))).delete(synchronize_session=False)
     db.session.commit()
-    flash(f"Deleted {len(paths)} item(s)")
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/delete-one")
@@ -816,12 +573,9 @@ def delete_one(slug):
     if not repo: abort(404)
     p = request.args.get("path")
     if p:
-        for f in File.query.filter(File.repo_id == repo.id,
-                                   or_(File.path == p, File.path.like(p + "/%"))
-                                   ).all():
-            delete_file_record(f)
+        File.query.filter(File.repo_id == repo.id,
+                          or_(File.path == p, File.path.like(p + "/%"))).delete(synchronize_session=False)
         db.session.commit()
-        flash(f"Deleted: {p}")
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/move", methods=["POST"])
@@ -831,26 +585,16 @@ def move_selected(slug):
     if not repo: abort(404)
     paths = request.form.getlist("paths")
     target = (request.form.get("target") or "").strip().strip("/")
-    if not paths:
-        flash("No items selected"); return redirect(url_for("manage_files", slug=repo.slug))
-    try:
-        for p in paths:
-            f = File.query.filter_by(repo_id=repo.id, path=p).first()
-            if not f: continue
-            name = p.split("/")[-1]
-            newpath = f"{target}/{name}" if target else name
-            if newpath == p: continue
-            if f.is_dir:
-                desc = File.query.filter(File.repo_id == repo.id,
-                                         File.path.like(p + "/%")).all()
-                for d in desc:
-                    d.path = newpath + d.path[len(p):]
-            f.path = newpath
-        db.session.commit()
-        flash(f"Moved {len(paths)} item(s)")
-    except Exception as e:
-        db.session.rollback()
-        flash(f"Move failed: {e}")
+    for p in paths:
+        f = File.query.filter_by(repo_id=repo.id, path=p).first()
+        if not f: continue
+        name = p.split("/")[-1]
+        newpath = f"{target}/{name}" if target else name
+        if f.is_dir:
+            desc = File.query.filter(File.repo_id == repo.id, File.path.like(p + "/%")).all()
+            for d in desc: d.path = newpath + d.path[len(p):]
+        f.path = newpath
+    db.session.commit()
     return redirect(url_for("manage_files", slug=repo.slug))
 
 @app.route("/_manage/<slug>/edit", methods=["GET", "POST"])
@@ -867,7 +611,7 @@ def edit_file(slug):
         f.size = len(f.content)
         f.updated_at = datetime.utcnow()
         db.session.commit()
-        flash(f"Saved: {path}")
+        flash(f"Saved")
         return redirect(url_for("edit_file", slug=repo.slug, path=path))
     body = f"""
     {_flash_html()}
@@ -881,11 +625,9 @@ def edit_file(slug):
           <a href="/_manage/{esc(repo.slug)}" style="padding:10px 18px">Back</a>
         </div>
       </form>
-    </div>
-    """
-    return page("Edit " + path, body)
+    </div>"""
+    return page("Edit", body)
 
-# ---------------- export ----------------
 @app.route("/export/<slug>")
 @admin_required
 def export_repo(slug):
@@ -900,15 +642,13 @@ def export_repo(slug):
                     with urllib.request.urlopen(f.cloud_url, timeout=15) as resp:
                         z.writestr(f.path, resp.read())
                 except Exception:
-                    z.writestr(f.path, f"<!-- Cloudinary fetch failed: {f.cloud_url} -->")
+                    z.writestr(f.path, f"<!-- fetch failed: {f.cloud_url} -->")
             else:
                 z.writestr(f.path, f.content or "")
         subs = Submission.query.filter_by(repo_id=repo.id).all()
-        subs_data = [{"time": s.created_at.isoformat(), "data": json.loads(s.data)}
-                     for s in subs]
+        subs_data = [{"time": s.created_at.isoformat(), "data": json.loads(s.data)} for s in subs]
         z.writestr("_submissions.json", json.dumps(subs_data, indent=2))
     buf.seek(0)
-
     dl = phone_download_dir()
     if dl:
         try:
@@ -917,12 +657,11 @@ def export_repo(slug):
             buf.seek(0)
         except Exception:
             pass
-
     return send_file(buf, mimetype="application/zip",
                      as_attachment=True, download_name=f"{repo.slug}.zip")
 
 @app.errorhandler(404)
-def nf(e): return page("Not found", '<div class="card"><h2>404 — Not found</h2></div>'), 404
+def nf(e): return page("Not found", '<div class="card"><h2>404</h2></div>'), 404
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

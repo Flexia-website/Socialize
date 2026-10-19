@@ -3,6 +3,7 @@ Socialize — repo host + form capture + file manager.
 Can host full static sites (like PH3D) from uploaded ZIPs.
 Admin routes return 404 for non-admins. Admin pages carry noindex.
 Per-repo password protection. Anti-DevTools script injection.
+Static assets (.css, .js, etc.) bypass the password gate so pages don't break.
 """
 import os, io, json, zipfile, mimetypes, html as html_mod
 from datetime import datetime
@@ -105,22 +106,6 @@ def admin_hidden(f):
 
 def get_repo(slug):
     return Repo.query.filter(func.lower(Repo.slug) == slug.lower()).first()
-
-def repo_unlocked(repo):
-    """True if admin, or repo has no password, or user has entered correct password."""
-    if is_admin():
-        return True
-    if not repo.password:
-        return True
-    
-    # FIX: Always allow static assets (CSS, JS, images) to load so the page doesn't break.
-    # Only block the main HTML pages behind the password gate.
-    static_exts = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", 
-                   ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".json")
-    if request.path.lower().endswith(static_exts):
-        return True
-        
-    return session.get(f"repo_unlocked_{repo.id}") is True
 
 def phone_download_dir():
     for c in ("/storage/emulated/0/Download", "/sdcard/Download",
@@ -506,24 +491,29 @@ def _serve_file(f, repo):
     path_lower = f.path.lower()
     content = f.content or ""
 
+    # Bypass password gate for static assets (CSS, JS, images) 
+    # This ensures the page renders even if the session hasn't been unlocked yet.
+    static_exts = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", 
+                   ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map")
+    if path_lower.endswith(static_exts):
+        mime = "text/plain"
+        if path_lower.endswith(".css"): mime = "text/css"
+        if path_lower.endswith((".js", ".mjs")): mime = "application/javascript"
+        if path_lower.endswith(".svg"): mime = "image/svg+xml"
+        if path_lower.endswith(".json"): mime = "application/json"
+        if path_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".ico")):
+            mime = "image/" + path_lower.split(".")[-1]
+        if path_lower.endswith((".woff", ".woff2", ".ttf", ".eot")):
+            mime = "font/" + path_lower.split(".")[-1]
+            
+        return content, 200, {"Content-Type": mime}
+
     if path_lower.endswith((".html", ".htm")):
         content = inject_capture(content, repo.slug, anti_devtools=True)
         return content, 200, {"Content-Type": "text/html; charset=utf-8"}
 
-    if path_lower.endswith((".js", ".mjs")):
-        return content, 200, {"Content-Type": "application/javascript; charset=utf-8"}
-
-    if path_lower.endswith(".css"):
-        return content, 200, {"Content-Type": "text/css; charset=utf-8"}
-
     if path_lower.endswith(".json"):
         return content, 200, {"Content-Type": "application/json; charset=utf-8"}
-
-    if path_lower.endswith(".svg"):
-        return content, 200, {"Content-Type": "image/svg+xml"}
-
-    if path_lower.endswith(".xml"):
-        return content, 200, {"Content-Type": "application/xml; charset=utf-8"}
 
     if path_lower.endswith(".txt"):
         return content, 200, {"Content-Type": "text/plain; charset=utf-8"}
@@ -539,8 +529,11 @@ def _serve_file(f, repo):
 def serve_index(slug):
     repo = get_repo(slug)
     if not repo: abort(404)
-    if not repo_unlocked(repo):
+    
+    # Check password for HTML pages
+    if repo.password and not is_admin() and session.get(f"repo_unlocked_{repo.id}") is not True:
         return redirect(url_for("repo_unlock", slug=repo.slug))
+        
     f = File.query.filter_by(repo_id=repo.id, path="index.html").first()
     if f: return _serve_file(f, repo)
     f = File.query.filter(File.repo_id == repo.id, File.path.like("%/index.html")).first()
@@ -552,8 +545,14 @@ def serve_index(slug):
 def serve_path(slug, filepath):
     repo = get_repo(slug)
     if not repo: abort(404)
-    if not repo_unlocked(repo):
-        return redirect(url_for("repo_unlock", slug=repo.slug))
+    
+    # Check password for non-static files
+    static_exts = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", 
+                   ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map")
+    if not filepath.lower().endswith(static_exts):
+        if repo.password and not is_admin() and session.get(f"repo_unlocked_{repo.id}") is not True:
+            return redirect(url_for("repo_unlock", slug=repo.slug))
+
     f = File.query.filter_by(repo_id=repo.id, path=filepath).first()
     if f:
         return _serve_file(f, repo)

